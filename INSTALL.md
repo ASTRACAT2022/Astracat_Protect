@@ -75,7 +75,6 @@ Challenge:
 ## Docker 
 
 ```bash
-docker build -t astracat/astracat-protect:1 .
 docker run -p 80:80 -p 443:443 -p 9090:9090 \
   -v /path/to/data:/data \
   -e ADMIN_TOKEN=changeme \
