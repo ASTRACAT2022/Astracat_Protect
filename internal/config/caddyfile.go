@@ -222,6 +222,8 @@ func defaultConfig() *Config {
 			RiskThreshold:    5,
 			RiskTTLSeconds:   600,
 			RiskStatusWindow: 60,
+			BanAfter:         3,
+			BanSeconds:       3600,
 		},
 		Challenge: ChallengeConfig{
 			Enabled:          true,

@@ -6,7 +6,7 @@ BIN_DIR="${ROOT_DIR}/bin"
 OUT_BIN="${BIN_DIR}/astracat-protect"
 
 if ! command -v go >/dev/null 2>&1; then
-  echo "Go is required. Install Go 1.22+ and retry." >&2
+  echo "Go is required. Install Go 1.24+ and retry." >&2
   exit 1
 fi
 

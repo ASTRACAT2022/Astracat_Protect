@@ -48,6 +48,8 @@ Limits:
 - `RISK_THRESHOLD`
 - `RISK_TTL` (seconds)
 - `RISK_STATUS_WINDOW` (seconds)
+- `BAN_AFTER` (violations before ban, default `3`)
+- `BAN_SECONDS` (ban duration, default `3600`)
 
 Challenge:
 - `CHALLENGE_TTL` (seconds)

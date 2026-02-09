@@ -9,7 +9,7 @@
 ```
 
 Что делает скрипт:
-- проверяет наличие Go (1.22+)
+- проверяет наличие Go (1.24+)
 - ставит зависимости
 - собирает бинарник в `./bin/astracat-protect`
 
@@ -66,6 +66,8 @@ Limits:
 - `RISK_THRESHOLD`
 - `RISK_TTL`
 - `RISK_STATUS_WINDOW`
+- `BAN_AFTER`
+- `BAN_SECONDS`
 
 Challenge:
 - `CHALLENGE_TTL`

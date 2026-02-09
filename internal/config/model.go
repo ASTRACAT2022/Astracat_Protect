@@ -49,6 +49,8 @@ type LimitsConfig struct {
 	RiskThreshold    int     `yaml:"risk_threshold"`
 	RiskTTLSeconds   int     `yaml:"risk_ttl_seconds"`
 	RiskStatusWindow int     `yaml:"risk_status_window"`
+	BanAfter         int     `yaml:"ban_after"`
+	BanSeconds       int     `yaml:"ban_seconds"`
 }
 
 type ChallengeConfig struct {

@@ -21,6 +21,8 @@ limits:
   risk_threshold: 5
   risk_ttl_seconds: 600
   risk_status_window: 60
+  ban_after: 3
+  ban_seconds: 3600
 
 challenge:
   enabled: true

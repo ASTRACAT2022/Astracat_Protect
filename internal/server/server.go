@@ -264,7 +264,13 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		metrics:     metricsReg,
 		rateLimiter: limits.NewRateLimiter(cfg.Limits.RPS, cfg.Limits.Burst, 10*time.Minute),
 		connLimiter: limits.NewConnLimiter(cfg.Limits.ConnLimit, cfg.Limits.WSConnLimit),
-		risk:        challenge.NewRiskTracker(cfg.Limits.RiskThreshold, time.Duration(cfg.Limits.RiskStatusWindow)*time.Second, time.Duration(cfg.Limits.RiskTTLSeconds)*time.Second),
+		risk: challenge.NewRiskTracker(
+			cfg.Limits.RiskThreshold,
+			time.Duration(cfg.Limits.RiskStatusWindow)*time.Second,
+			time.Duration(cfg.Limits.RiskTTLSeconds)*time.Second,
+			cfg.Limits.BanAfter,
+			time.Duration(cfg.Limits.BanSeconds)*time.Second,
+		),
 		challenge:   challengeMgr,
 		challengeEx: cfg.Challenge.ExemptGlobs,
 		limits:      cfg.Limits,
@@ -280,6 +286,9 @@ func (h *handler) cleanupLoop() {
 	for range ticker.C {
 		h.rateLimiter.Cleanup()
 		h.risk.Cleanup()
+		if h.challenge != nil {
+			h.challenge.Cleanup()
+		}
 	}
 }
 
@@ -319,22 +328,34 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := limits.ClientIP(r.RemoteAddr)
+
 	if len(r.URL.RequestURI()) > h.limits.MaxURLLength {
 		ctx.Blocked = true
+		h.risk.RegisterLimitViolation(ip)
 		h.writeResponse(rec, r, ctx, http.StatusRequestURITooLong, "uri too long")
 		return
 	}
 
 	if !isACMEPath(r.URL.Path) {
+		if banned, until := h.risk.IsBanned(ip); banned {
+			ctx.Blocked = true
+			h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+			return
+		}
 		if h.challenge != nil && r.URL.Path == h.challenge.VerifyPath {
 			h.routeRequest(rec, r, ctx)
 			return
 		}
-		ip := limits.ClientIP(r.RemoteAddr)
 		if !h.rateLimiter.Allow(ip) {
 			ctx.RateLimited = true
 			atomic.AddUint64(&h.metrics.RateLimited, 1)
 			h.risk.Penalize(ip, 2)
+			if banned, until := h.risk.RegisterLimitViolation(ip); banned {
+				ctx.Blocked = true
+				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+				return
+			}
 			h.writeResponse(rec, r, ctx, http.StatusTooManyRequests, "rate limited")
 			return
 		}
@@ -342,6 +363,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ws := isWebSocket(r)
 		if !h.connLimiter.Allow(ip, ws) {
 			ctx.Blocked = true
+			if banned, until := h.risk.RegisterLimitViolation(ip); banned {
+				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+				return
+			}
 			h.writeResponse(rec, r, ctx, http.StatusTooManyRequests, "too many connections")
 			return
 		}
@@ -361,7 +386,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			atomic.AddUint64(&h.metrics.ChallengeServed, 1)
 			rec.Header().Set("Content-Type", "text/html; charset=utf-8")
 			rec.WriteHeader(http.StatusOK)
-			_, _ = rec.Write([]byte(h.challenge.InterstitialHTML(r.URL.RequestURI())))
+			_, _ = rec.Write([]byte(h.challenge.InterstitialHTML(ip, r.UserAgent(), r.URL.RequestURI())))
 			return
 		}
 	}
@@ -372,7 +397,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.routeRequest(rec, r, ctx)
 	if !isACMEPath(r.URL.Path) {
-		ip := limits.ClientIP(r.RemoteAddr)
 		h.risk.UpdateStatus(ip, rec.status)
 	}
 }
@@ -482,8 +506,37 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 }
 
 func (h *handler) handleVerify(w http.ResponseWriter, r *http.Request, ctx *requestContext) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		ctx.Blocked = true
+		h.writeResponse(w, r, ctx, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		ctx.Blocked = true
+		h.writeResponse(w, r, ctx, http.StatusBadRequest, "invalid form")
+		return
+	}
+
 	ip := limits.ClientIP(r.RemoteAddr)
 	ua := r.UserAgent()
+	token := r.FormValue("token")
+	answer := r.FormValue("answer")
+	retryURL := r.FormValue("url")
+	if retryURL == "" {
+		retryURL = "/"
+	}
+
+	returnURL, ok := h.challenge.VerifyCaptcha(token, answer, ip, ua)
+	if !ok {
+		ctx.ChallengeApplied = true
+		atomic.AddUint64(&h.metrics.ChallengeServed, 1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		ctx.Status = http.StatusForbidden
+		_, _ = w.Write([]byte(h.challenge.InterstitialHTML(ip, ua, retryURL)))
+		return
+	}
+
 	exp := time.Now().Add(h.challenge.CookieTTL)
 	value := h.challenge.CookieValue(ip, ua, exp)
 
@@ -497,10 +550,6 @@ func (h *handler) handleVerify(w http.ResponseWriter, r *http.Request, ctx *requ
 	}
 	http.SetCookie(w, cookie)
 
-	returnURL := r.URL.Query().Get("url")
-	if returnURL == "" {
-		returnURL = "/"
-	}
 	ctx.Status = http.StatusFound
 	http.Redirect(w, r, returnURL, http.StatusFound)
 }
@@ -697,6 +746,16 @@ func applyEnv(cfg *config.Config) {
 	if v := os.Getenv("RISK_STATUS_WINDOW"); v != "" {
 		if n, err := parseInt(v); err == nil {
 			cfg.Limits.RiskStatusWindow = n
+		}
+	}
+	if v := os.Getenv("BAN_AFTER"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.BanAfter = n
+		}
+	}
+	if v := os.Getenv("BAN_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.BanSeconds = n
 		}
 	}
 	if v := os.Getenv("CHALLENGE_TTL"); v != "" {
