@@ -8,6 +8,11 @@ Reverse-proxy / edge-gateway with Auto-HTTPS, L7 protections, and metrics.
 ./install
 ```
 
+## Документация
+
+- `INSTALL.md` — локальная сборка и запуск
+- `DOCKER_DEPLOY.md` — production deploy в Docker, конфиги и диагностика
+
 ## Запуск (dev)
 
 ```bash

@@ -277,19 +277,21 @@ func (m *Manager) InterstitialHTML(ip, ua, original string) string {
 <style>
 body{font-family:Arial,sans-serif;background:#0b0c10;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .card{background:#1f2833;padding:24px 32px;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.3);min-width:280px}
-.spinner{width:26px;height:26px;border:3px solid #45a29e;border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;display:inline-block;margin-right:12px;vertical-align:middle}
+.spinner{width:26px;height:26px;border:3px solid #45a29e;border-top-color:transparent;border-radius:50%%;animation:spin 1s linear infinite;display:inline-block;margin-right:12px;vertical-align:middle}
 .status{margin-bottom:16px}
 .captcha-label{display:block;margin-bottom:8px}
 .input{width:100%%;padding:10px;border-radius:8px;border:1px solid #3a4a5a;background:#0f141a;color:#fff;box-sizing:border-box}
 .btn{width:100%%;margin-top:10px;padding:10px;border:0;border-radius:8px;background:#45a29e;color:#0b0c10;font-weight:bold;cursor:pointer}
 .btn[disabled]{opacity:.5;cursor:not-allowed}
 .brand{margin-top:12px;font-size:12px;color:#9aa7b5;text-align:center;letter-spacing:.4px}
+.hint{margin:8px 0 12px 0;font-size:12px;color:#c6d0db}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 <div class="card">
   <div class="status"><span class="spinner"></span>Checking your browser... <span id="countdown">3</span>s</div>
+  <div class="hint">Wait 3 seconds, then solve the captcha.</div>
   <form method="POST" action="%s">
     <input type="hidden" name="token" value="%s" />
     <input type="hidden" name="url" value="%s" />
