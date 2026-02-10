@@ -60,6 +60,7 @@ Limits:
 - `RATE_LIMIT_BURST`
 - `CONN_LIMIT`
 - `WS_CONN_LIMIT`
+- `WHITELIST_IPS` (через запятую, поддерживает CIDR)
 - `MAX_BODY_BYTES`
 - `MAX_HEADER_BYTES`
 - `MAX_URL_LENGTH`

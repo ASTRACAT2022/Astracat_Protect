@@ -39,18 +39,19 @@ type ACMEConfig struct {
 }
 
 type LimitsConfig struct {
-	RPS              float64 `yaml:"rps"`
-	Burst            float64 `yaml:"burst"`
-	ConnLimit        int     `yaml:"conn_limit"`
-	WSConnLimit      int     `yaml:"ws_conn_limit"`
-	MaxBodyBytes     int64   `yaml:"max_body_bytes"`
-	MaxHeaderBytes   int     `yaml:"max_header_bytes"`
-	MaxURLLength     int     `yaml:"max_url_length"`
-	RiskThreshold    int     `yaml:"risk_threshold"`
-	RiskTTLSeconds   int     `yaml:"risk_ttl_seconds"`
-	RiskStatusWindow int     `yaml:"risk_status_window"`
-	BanAfter         int     `yaml:"ban_after"`
-	BanSeconds       int     `yaml:"ban_seconds"`
+	RPS              float64  `yaml:"rps"`
+	Burst            float64  `yaml:"burst"`
+	ConnLimit        int      `yaml:"conn_limit"`
+	WSConnLimit      int      `yaml:"ws_conn_limit"`
+	WhitelistIPs     []string `yaml:"whitelist_ips"`
+	MaxBodyBytes     int64    `yaml:"max_body_bytes"`
+	MaxHeaderBytes   int      `yaml:"max_header_bytes"`
+	MaxURLLength     int      `yaml:"max_url_length"`
+	RiskThreshold    int      `yaml:"risk_threshold"`
+	RiskTTLSeconds   int      `yaml:"risk_ttl_seconds"`
+	RiskStatusWindow int      `yaml:"risk_status_window"`
+	BanAfter         int      `yaml:"ban_after"`
+	BanSeconds       int      `yaml:"ban_seconds"`
 }
 
 type ChallengeConfig struct {

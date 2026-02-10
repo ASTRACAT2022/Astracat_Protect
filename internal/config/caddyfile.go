@@ -216,6 +216,7 @@ func defaultConfig() *Config {
 			Burst:            40,
 			ConnLimit:        100,
 			WSConnLimit:      20,
+			WhitelistIPs:     []string{},
 			MaxBodyBytes:     10 << 20,
 			MaxHeaderBytes:   1 << 20,
 			MaxURLLength:     2048,

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -209,6 +210,7 @@ type handler struct {
 	challenge   *challenge.Manager
 	challengeEx []string
 	limits      config.LimitsConfig
+	allowlist   *ipAllowlist
 }
 
 type routeHandle struct {
@@ -274,7 +276,14 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		challenge:   challengeMgr,
 		challengeEx: cfg.Challenge.ExemptGlobs,
 		limits:      cfg.Limits,
+		allowlist:   nil,
 	}
+
+	allowlist, err := newIPAllowlist(cfg.Limits.WhitelistIPs)
+	if err != nil {
+		return nil, err
+	}
+	h.allowlist = allowlist
 
 	go h.cleanupLoop()
 	return h, nil
@@ -329,8 +338,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := limits.ClientIP(r.RemoteAddr)
+	isTrustedIP := h.allowlist.Contains(ip)
 
-	if len(r.URL.RequestURI()) > h.limits.MaxURLLength {
+	if len(r.URL.RequestURI()) > h.limits.MaxURLLength && !isTrustedIP {
 		ctx.Blocked = true
 		h.risk.RegisterLimitViolation(ip)
 		h.writeResponse(rec, r, ctx, http.StatusRequestURITooLong, "uri too long")
@@ -338,16 +348,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !isACMEPath(r.URL.Path) {
-		if banned, until := h.risk.IsBanned(ip); banned {
-			ctx.Blocked = true
-			h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
-			return
+		if !isTrustedIP {
+			if banned, until := h.risk.IsBanned(ip); banned {
+				ctx.Blocked = true
+				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+				return
+			}
 		}
 		if h.challenge != nil && r.URL.Path == h.challenge.VerifyPath {
 			h.routeRequest(rec, r, ctx)
 			return
 		}
-		if !h.rateLimiter.Allow(ip) {
+		if !isTrustedIP && !h.rateLimiter.Allow(ip) {
 			ctx.RateLimited = true
 			atomic.AddUint64(&h.metrics.RateLimited, 1)
 			h.risk.Penalize(ip, 2)
@@ -361,7 +373,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		ws := isWebSocket(r)
-		if !h.connLimiter.Allow(ip, ws) {
+		if !isTrustedIP && !h.connLimiter.Allow(ip, ws) {
 			ctx.Blocked = true
 			if banned, until := h.risk.RegisterLimitViolation(ip); banned {
 				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
@@ -374,14 +386,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			atomic.AddInt64(&h.metrics.WSActive, 1)
 		}
 		defer func() {
-			h.connLimiter.Done(ip, ws)
+			if !isTrustedIP {
+				h.connLimiter.Done(ip, ws)
+			}
 			if ws {
 				atomic.AddInt64(&h.metrics.WSActive, -1)
 			}
 		}()
 
-		h.risk.UpdateRequest(ip, r)
-		if h.challengeNeeded(r, ip) {
+		if !isTrustedIP {
+			h.risk.UpdateRequest(ip, r)
+		}
+		if !isTrustedIP && h.challengeNeeded(r, ip) {
 			ctx.ChallengeApplied = true
 			atomic.AddUint64(&h.metrics.ChallengeServed, 1)
 			rec.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -396,7 +412,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.routeRequest(rec, r, ctx)
-	if !isACMEPath(r.URL.Path) {
+	if !isACMEPath(r.URL.Path) && !isTrustedIP {
 		h.risk.UpdateStatus(ip, rec.status)
 	}
 }
@@ -718,6 +734,17 @@ func applyEnv(cfg *config.Config) {
 			cfg.Limits.WSConnLimit = n
 		}
 	}
+	if v := os.Getenv("WHITELIST_IPS"); v != "" {
+		parts := strings.Split(v, ",")
+		items := make([]string, 0, len(parts))
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				items = append(items, trimmed)
+			}
+		}
+		cfg.Limits.WhitelistIPs = items
+	}
 	if v := os.Getenv("MAX_BODY_BYTES"); v != "" {
 		if n, err := parseInt64(v); err == nil {
 			cfg.Limits.MaxBodyBytes = n
@@ -819,4 +846,55 @@ func parseFloat(s string) (float64, error) {
 		frac *= 0.1
 	}
 	return v, nil
+}
+
+type ipAllowlist struct {
+	exact map[string]struct{}
+	nets  []*net.IPNet
+}
+
+func newIPAllowlist(values []string) (*ipAllowlist, error) {
+	a := &ipAllowlist{
+		exact: map[string]struct{}{},
+		nets:  make([]*net.IPNet, 0),
+	}
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if strings.Contains(v, "/") {
+			_, network, err := net.ParseCIDR(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid whitelist cidr: %s", v)
+			}
+			a.nets = append(a.nets, network)
+			continue
+		}
+		ip := net.ParseIP(v)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid whitelist ip: %s", v)
+		}
+		a.exact[ip.String()] = struct{}{}
+	}
+	return a, nil
+}
+
+func (a *ipAllowlist) Contains(ipStr string) bool {
+	if a == nil {
+		return false
+	}
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return false
+	}
+	if _, ok := a.exact[ip.String()]; ok {
+		return true
+	}
+	for _, network := range a.nets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

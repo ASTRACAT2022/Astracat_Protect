@@ -40,6 +40,9 @@ limits:
   burst: 100
   conn_limit: 200
   ws_conn_limit: 50
+  whitelist_ips:
+    - 95.27.149.224
+    - 172.18.0.0/16
   max_body_bytes: 10485760
   max_header_bytes: 1048576
   max_url_length: 4096
@@ -187,4 +190,3 @@ docker build --no-cache -t astracat/protect:3 .
 docker login
 docker push astracat/protect:3
 ```
-
