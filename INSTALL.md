@@ -82,6 +82,6 @@ docker run -p 80:80 -p 443:443 -p 9090:9090 \
   -v /path/to/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=you@example.com \
-  astracat/protect:4 \
+  astracat/protect:5 \
   -config /app/configs/astra.yaml
 ```
