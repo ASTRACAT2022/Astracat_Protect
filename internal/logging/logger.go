@@ -28,6 +28,10 @@ type Entry struct {
 	ChallengeApplied bool   `json:"challenge_applied"`
 	RateLimited      bool   `json:"rate_limited"`
 	Blocked          bool   `json:"blocked"`
+	WAFBlocked       bool   `json:"waf_blocked,omitempty"`
+	WAFScore         int    `json:"waf_score,omitempty"`
+	WAFRules         string `json:"waf_rules,omitempty"`
+	WAFReason        string `json:"waf_reason,omitempty"`
 }
 
 func New(format string, output string) *Logger {
@@ -93,9 +97,10 @@ func (l *Logger) write(entry Entry) {
 		fmt.Fprintln(l.out, string(b))
 		return
 	}
-	fmt.Fprintf(l.out, "%s %s %s %s %d %dms upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t\n",
+	fmt.Fprintf(l.out, "%s %s %s %s %d %dms upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t waf_blocked=%t waf_score=%d waf_rules=%s waf_reason=%s\n",
 		entry.Timestamp, entry.RemoteIP, entry.Method, entry.URI, entry.Status, entry.LatencyMS,
-		entry.Upstream, entry.Route, entry.ChallengeApplied, entry.RateLimited, entry.Blocked)
+		entry.Upstream, entry.Route, entry.ChallengeApplied, entry.RateLimited, entry.Blocked,
+		entry.WAFBlocked, entry.WAFScore, entry.WAFRules, entry.WAFReason)
 }
 
 func clientIP(remoteAddr string) string {

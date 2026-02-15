@@ -28,6 +28,7 @@ ADMIN_TOKEN=changeme ./bin/astracat-protect -config ./configs/astra.yaml -http :
 - `acme` — настройки TLS/ACME
 - `limits` — лимиты и risk scoring
 - `challenge` — антибот‑проверка
+- `waf` — сигнатурный WAF (режим block/log, scoring, исключения)
 - `servers` — маршрутизация (хосты, matchers, strip_prefix, upstream)
 
 Обязательное:
@@ -62,6 +63,9 @@ Limits:
 - `WS_CONN_LIMIT`
 - `WHITELIST_IPS` (через запятую, поддерживает CIDR)
 - `MAX_BODY_BYTES`
+- `MAX_URI_BYTES`
+- `MAX_QUERY_BYTES`
+- `MAX_PARAMS`
 - `MAX_HEADER_BYTES`
 - `MAX_URL_LENGTH`
 - `RISK_THRESHOLD`
@@ -69,11 +73,30 @@ Limits:
 - `RISK_STATUS_WINDOW`
 - `BAN_AFTER`
 - `BAN_SECONDS`
+- `RATE_429_BAN_AFTER`
+- `RATE_429_WINDOW_SECONDS`
+- `RATE_429_BAN_SECONDS`
+- `WAF_BAN_SECONDS`
+- `rate_policies` в YAML для отдельных лимитов по маршрутам (например `/api/*`, `/login`)
 
 Challenge:
 - `CHALLENGE_TTL`
 - `CHALLENGE_BIND_IP`
 - `CHALLENGE_BIND_UA`
+
+WAF:
+- `WAF_ENABLED`
+- `WAF_MODE` (`block` или `log`)
+- `WAF_SCORE_THRESHOLD`
+- `WAF_INBOUND_THRESHOLD`
+- `WAF_PARANOIA_LEVEL` (1..4)
+- `WAF_MAX_INSPECT_BYTES`
+- `WAF_MAX_VALUES_PER_COLLECTION`
+- `WAF_MAX_TOTAL_VALUES`
+- `WAF_MAX_JSON_VALUES`
+- `WAF_MAX_BODY_VALUES`
+- `WAF_ALLOWED_METHODS` (через запятую)
+- `WAF_BLOCKED_CONTENT_TYPES` (через запятую, regex-фрагменты)
 
 ## Docker 
 

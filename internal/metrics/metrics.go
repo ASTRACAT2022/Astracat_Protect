@@ -43,6 +43,7 @@ type Registry struct {
 	UpstreamErrors   uint64
 	RateLimited      uint64
 	ChallengeServed  uint64
+	WAFBlocked       uint64
 	WSActive         int64
 	LatencyHistogram *Histogram
 }
@@ -70,6 +71,8 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "astracat_rate_limited_total %d\n", atomic.LoadUint64(&r.RateLimited))
 	fmt.Fprintln(w, "# TYPE astracat_challenge_served_total counter")
 	fmt.Fprintf(w, "astracat_challenge_served_total %d\n", atomic.LoadUint64(&r.ChallengeServed))
+	fmt.Fprintln(w, "# TYPE astracat_waf_blocked_total counter")
+	fmt.Fprintf(w, "astracat_waf_blocked_total %d\n", atomic.LoadUint64(&r.WAFBlocked))
 	fmt.Fprintln(w, "# TYPE astracat_ws_active gauge")
 	fmt.Fprintf(w, "astracat_ws_active %d\n", atomic.LoadInt64(&r.WSActive))
 

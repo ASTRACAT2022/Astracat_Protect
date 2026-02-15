@@ -1,12 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -21,6 +24,7 @@ import (
 	"astracat-protect/internal/logging"
 	"astracat-protect/internal/metrics"
 	"astracat-protect/internal/proxy"
+	"astracat-protect/internal/waf"
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -52,6 +56,9 @@ func Run(cfg *config.Config, opts Options) error {
 		Addr:              opts.HTTPSListen,
 		Handler:           rt.publicHandler(logr, metricsReg),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
 
@@ -65,6 +72,9 @@ func Run(cfg *config.Config, opts Options) error {
 		Addr:              opts.HTTPListen,
 		Handler:           autocertMgr.HTTPHandler(http.HandlerFunc(redirectToHTTPS(opts.HTTPSListen))),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
 
@@ -209,8 +219,24 @@ type handler struct {
 	risk        *challenge.RiskTracker
 	challenge   *challenge.Manager
 	challengeEx []string
+	waf         *waf.Engine
+	wafEx       []string
+	wafExHosts         map[string]struct{}
+	wafExRuleIDs       map[string]struct{}
+	wafExRuleIDsByGlob map[string]map[string]struct{}
 	limits      config.LimitsConfig
 	allowlist   *ipAllowlist
+	routeRatePolicies   []routeRatePolicy
+	globalRatePenalty   *limits.PenaltyBox
+	wafPenaltySeconds   int
+}
+
+type routeRatePolicy struct {
+	name    string
+	globs   []string
+	keyMode string
+	limiter *limits.RateLimiter
+	penalty *limits.PenaltyBox
 }
 
 type routeHandle struct {
@@ -258,6 +284,107 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		challengeMgr.BindIP = cfg.Challenge.BindIP
 		challengeMgr.BindUA = cfg.Challenge.BindUA
 	}
+	wafRules := make([]waf.RuleConfig, 0, len(cfg.WAF.Rules))
+	for _, rc := range cfg.WAF.Rules {
+		wafRules = append(wafRules, waf.RuleConfig{
+			ID:          rc.ID,
+			Description: rc.Description,
+			Pattern:     rc.Pattern,
+			Targets:     rc.Targets,
+			Score:       rc.Score,
+			Phase:       rc.Phase,
+			Action:      rc.Action,
+			Paranoia:    rc.Paranoia,
+			Transforms:  rc.Transforms,
+		})
+	}
+	wafEngine, err := waf.New(waf.Config{
+		Enabled:             cfg.WAF.Enabled,
+		Mode:                cfg.WAF.Mode,
+		ScoreThreshold:      cfg.WAF.ScoreThreshold,
+		InboundThreshold:    cfg.WAF.InboundThreshold,
+		ParanoiaLevel:       cfg.WAF.ParanoiaLevel,
+		MaxInspectBytes:     cfg.WAF.MaxInspectBytes,
+		MaxValuesPerCollection: cfg.WAF.MaxValuesPerCollection,
+		MaxTotalValues:      cfg.WAF.MaxTotalValues,
+		MaxJSONValues:       cfg.WAF.MaxJSONValues,
+		MaxBodyValues:       cfg.WAF.MaxBodyValues,
+		AllowedMethods:      cfg.WAF.AllowedMethods,
+		BlockedContentTypes: cfg.WAF.BlockedContentTypes,
+		Rules:               wafRules,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	wafExRuleIDs := make(map[string]struct{}, len(cfg.WAF.ExemptRuleIDs))
+	for _, id := range cfg.WAF.ExemptRuleIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			wafExRuleIDs[id] = struct{}{}
+		}
+	}
+	wafExRuleIDsByGlob := make(map[string]map[string]struct{}, len(cfg.WAF.ExemptRuleIDsByGlob))
+	for glob, ids := range cfg.WAF.ExemptRuleIDsByGlob {
+		g := strings.TrimSpace(glob)
+		if g == "" {
+			continue
+		}
+		set := map[string]struct{}{}
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				set[id] = struct{}{}
+			}
+		}
+		wafExRuleIDsByGlob[g] = set
+	}
+	wafExHosts := make(map[string]struct{}, len(cfg.WAF.ExemptHosts))
+	for _, host := range cfg.WAF.ExemptHosts {
+		h := strings.ToLower(strings.TrimSpace(host))
+		if h != "" {
+			wafExHosts[h] = struct{}{}
+		}
+	}
+
+	defaultRatePenalty := limits.NewPenaltyBox(
+		cfg.Limits.Rate429BanAfter,
+		time.Duration(cfg.Limits.Rate429WindowSec)*time.Second,
+		time.Duration(cfg.Limits.Rate429BanSec)*time.Second,
+	)
+	routeRatePolicies := make([]routeRatePolicy, 0, len(cfg.Limits.RatePolicies))
+	for _, p := range cfg.Limits.RatePolicies {
+		if p.RPS <= 0 || p.Burst <= 0 || len(p.PathGlobs) == 0 {
+			continue
+		}
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			name = "route"
+		}
+		keyMode := strings.ToLower(strings.TrimSpace(p.Key))
+		if keyMode == "" {
+			keyMode = "ip_route"
+		}
+		banAfter := p.BanAfter429
+		if banAfter <= 0 {
+			banAfter = cfg.Limits.Rate429BanAfter
+		}
+		banWindow := p.BanWindowSec
+		if banWindow <= 0 {
+			banWindow = cfg.Limits.Rate429WindowSec
+		}
+		banSec := p.BanSec
+		if banSec <= 0 {
+			banSec = cfg.Limits.Rate429BanSec
+		}
+		routeRatePolicies = append(routeRatePolicies, routeRatePolicy{
+			name:    name,
+			globs:   p.PathGlobs,
+			keyMode: keyMode,
+			limiter: limits.NewRateLimiter(p.RPS, p.Burst, 10*time.Minute),
+			penalty: limits.NewPenaltyBox(banAfter, time.Duration(banWindow)*time.Second, time.Duration(banSec)*time.Second),
+		})
+	}
 
 	h := &handler{
 		proxies:     proxies,
@@ -275,8 +402,16 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		),
 		challenge:   challengeMgr,
 		challengeEx: cfg.Challenge.ExemptGlobs,
+		waf:         wafEngine,
+		wafEx:       cfg.WAF.ExemptGlobs,
+		wafExHosts:         wafExHosts,
+		wafExRuleIDs:       wafExRuleIDs,
+		wafExRuleIDsByGlob: wafExRuleIDsByGlob,
 		limits:      cfg.Limits,
 		allowlist:   nil,
+		routeRatePolicies: routeRatePolicies,
+		globalRatePenalty: defaultRatePenalty,
+		wafPenaltySeconds: cfg.Limits.WAFBanSec,
 	}
 
 	allowlist, err := newIPAllowlist(cfg.Limits.WhitelistIPs)
@@ -295,6 +430,17 @@ func (h *handler) cleanupLoop() {
 	for range ticker.C {
 		h.rateLimiter.Cleanup()
 		h.risk.Cleanup()
+		if h.globalRatePenalty != nil {
+			h.globalRatePenalty.Cleanup()
+		}
+		for _, rp := range h.routeRatePolicies {
+			if rp.limiter != nil {
+				rp.limiter.Cleanup()
+			}
+			if rp.penalty != nil {
+				rp.penalty.Cleanup()
+			}
+		}
 		if h.challenge != nil {
 			h.challenge.Cleanup()
 		}
@@ -340,15 +486,24 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ip := limits.ClientIP(r.RemoteAddr)
 	isTrustedIP := h.allowlist.Contains(ip)
 
-	if len(r.URL.RequestURI()) > h.limits.MaxURLLength && !isTrustedIP {
-		ctx.Blocked = true
-		h.risk.RegisterLimitViolation(ip)
-		h.writeResponse(rec, r, ctx, http.StatusRequestURITooLong, "uri too long")
-		return
+	if !isTrustedIP {
+		if status, reason := h.checkProtocolLimits(r); status != 0 {
+			ctx.Blocked = true
+			h.risk.RegisterLimitViolation(ip)
+			h.writeResponse(rec, r, ctx, status, reason)
+			return
+		}
 	}
 
 	if !isACMEPath(r.URL.Path) {
 		if !isTrustedIP {
+			if h.globalRatePenalty != nil {
+				if banned, until := h.globalRatePenalty.IsBanned(ip); banned {
+					ctx.Blocked = true
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip penalty-banned until %s", until.UTC().Format(time.RFC3339)))
+					return
+				}
+			}
 			if banned, until := h.risk.IsBanned(ip); banned {
 				ctx.Blocked = true
 				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
@@ -359,23 +514,36 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.routeRequest(rec, r, ctx)
 			return
 		}
-		if !isTrustedIP && !h.rateLimiter.Allow(ip) {
-			ctx.RateLimited = true
-			atomic.AddUint64(&h.metrics.RateLimited, 1)
-			h.risk.Penalize(ip, 2)
-			if banned, until := h.risk.RegisterLimitViolation(ip); banned {
-				ctx.Blocked = true
-				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+
+		if !isTrustedIP {
+			allowed, policyName, penaltyUntil := h.allowByRatePolicies(ip, r.URL.Path)
+			if !allowed {
+				ctx.RateLimited = true
+				if policyName != "" {
+					ctx.Route = "rate:" + policyName
+				}
+				atomic.AddUint64(&h.metrics.RateLimited, 1)
+				h.risk.Penalize(ip, 2)
+				if !penaltyUntil.IsZero() {
+					ctx.Blocked = true
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("rate penalty until %s", penaltyUntil.UTC().Format(time.RFC3339)))
+					return
+				}
+				if banned, until := h.risk.RegisterLimitViolation(ip); banned {
+					ctx.Blocked = true
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
+					return
+				}
+				h.writeResponse(rec, r, ctx, http.StatusTooManyRequests, "rate limited")
 				return
 			}
-			h.writeResponse(rec, r, ctx, http.StatusTooManyRequests, "rate limited")
-			return
 		}
 
 		ws := isWebSocket(r)
 		if !isTrustedIP && !h.connLimiter.Allow(ip, ws) {
 			ctx.Blocked = true
 			if banned, until := h.risk.RegisterLimitViolation(ip); banned {
+				ctx.Blocked = true
 				h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("ip banned until %s", until.UTC().Format(time.RFC3339)))
 				return
 			}
@@ -396,6 +564,25 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if !isTrustedIP {
 			h.risk.UpdateRequest(ip, r)
+		}
+		if !isTrustedIP && h.waf != nil && h.waf.Enabled() && !isExemptPath(r.URL.Path, h.wafEx) && !h.isWAFHostExempt(r.Host) {
+			decision, err := h.waf.Inspect(r, &waf.InspectOptions{SkipRuleIDs: h.wafRuleExclusionsForPath(r.URL.Path)})
+			if err == nil && decision.Matched {
+				ctx.WAFScore = decision.Score
+				ctx.WAFRules = decision.RuleIDs
+				ctx.WAFReason = decision.Reason
+				if decision.Blocked {
+					ctx.Blocked = true
+					ctx.WAFBlocked = true
+					atomic.AddUint64(&h.metrics.WAFBlocked, 1)
+					h.risk.Penalize(ip, 3)
+					if h.wafPenaltySeconds > 0 && h.globalRatePenalty != nil {
+						h.globalRatePenalty.RegisterBan(ip, time.Duration(h.wafPenaltySeconds)*time.Second)
+					}
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, "blocked by waf")
+					return
+				}
+			}
 		}
 		if !isTrustedIP && h.challengeNeeded(r, ip) {
 			ctx.ChallengeApplied = true
@@ -577,8 +764,173 @@ func (h *handler) finishLog(w http.ResponseWriter, r *http.Request, ctx *request
 		ChallengeApplied: ctx.ChallengeApplied,
 		RateLimited:      ctx.RateLimited,
 		Blocked:          ctx.Blocked,
+		WAFBlocked:       ctx.WAFBlocked,
+		WAFScore:         ctx.WAFScore,
+		WAFRules:         strings.Join(ctx.WAFRules, ","),
+		WAFReason:        ctx.WAFReason,
 	}
 	h.log.Write(entry)
+}
+
+func (h *handler) checkProtocolLimits(r *http.Request) (int, string) {
+	if h.limits.MaxURIBytes > 0 && len(r.URL.RequestURI()) > h.limits.MaxURIBytes {
+		return http.StatusRequestURITooLong, "uri too long"
+	}
+	if h.limits.MaxURLLength > 0 && len(r.URL.RequestURI()) > h.limits.MaxURLLength {
+		return http.StatusRequestURITooLong, "uri too long"
+	}
+	if h.limits.MaxQueryBytes > 0 && len(r.URL.RawQuery) > h.limits.MaxQueryBytes {
+		return http.StatusRequestURITooLong, "query too long"
+	}
+	if h.limits.MaxHeaderBytes > 0 {
+		if total := headerBytes(r.Header); total > h.limits.MaxHeaderBytes {
+			return http.StatusRequestHeaderFieldsTooLarge, "headers too large"
+		}
+	}
+	if h.limits.MaxParams > 0 {
+		if countQueryParams(r.URL.Query()) > h.limits.MaxParams {
+			return http.StatusBadRequest, "too many parameters"
+		}
+		if isURLEncoded(r.Header.Get("Content-Type")) {
+			maxRead := int64(64 << 10)
+			if h.limits.MaxBodyBytes > 0 && h.limits.MaxBodyBytes < maxRead {
+				maxRead = h.limits.MaxBodyBytes
+			}
+			if n, err := countBodyFormParams(r, maxRead); err == nil && n > h.limits.MaxParams {
+				return http.StatusBadRequest, "too many form parameters"
+			}
+		}
+	}
+	return 0, ""
+}
+
+func (h *handler) allowByRatePolicies(ip string, reqPath string) (bool, string, time.Time) {
+	for _, p := range h.routeRatePolicies {
+		if !pathMatchesAny(reqPath, p.globs) {
+			continue
+		}
+		key := rateKey(p.keyMode, ip, p.name)
+		if p.penalty != nil {
+			if banned, until := p.penalty.IsBanned(key); banned {
+				return false, p.name, until
+			}
+		}
+		if p.limiter != nil && !p.limiter.Allow(key) {
+			if p.penalty != nil {
+				if banned, until := p.penalty.RegisterFailure(key); banned {
+					return false, p.name, until
+				}
+			}
+			return false, p.name, time.Time{}
+		}
+	}
+
+	if h.globalRatePenalty != nil {
+		if banned, until := h.globalRatePenalty.IsBanned(ip); banned {
+			return false, "global", until
+		}
+	}
+	if h.rateLimiter != nil && !h.rateLimiter.Allow(ip) {
+		if h.globalRatePenalty != nil {
+			if banned, until := h.globalRatePenalty.RegisterFailure(ip); banned {
+				return false, "global", until
+			}
+		}
+		return false, "global", time.Time{}
+	}
+	return true, "", time.Time{}
+}
+
+func (h *handler) wafRuleExclusionsForPath(reqPath string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for id := range h.wafExRuleIDs {
+		out[id] = struct{}{}
+	}
+	for glob, ids := range h.wafExRuleIDsByGlob {
+		if !matchPath(glob, reqPath) {
+			continue
+		}
+		for id := range ids {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (h *handler) isWAFHostExempt(host string) bool {
+	if len(h.wafExHosts) == 0 {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(host))
+	if idx := strings.Index(v, ":"); idx != -1 {
+		v = v[:idx]
+	}
+	_, ok := h.wafExHosts[v]
+	return ok
+}
+
+func headerBytes(hdr http.Header) int {
+	total := 0
+	for k, vals := range hdr {
+		total += len(k)
+		for _, v := range vals {
+			total += len(v)
+		}
+	}
+	return total
+}
+
+func countQueryParams(q map[string][]string) int {
+	total := 0
+	for _, vals := range q {
+		total += len(vals)
+		if len(vals) == 0 {
+			total++
+		}
+	}
+	return total
+}
+
+func isURLEncoded(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	return ct == "application/x-www-form-urlencoded"
+}
+
+func countBodyFormParams(r *http.Request, maxRead int64) (int, error) {
+	if r == nil || r.Body == nil || maxRead <= 0 {
+		return 0, nil
+	}
+	chunk, err := io.ReadAll(io.LimitReader(r.Body, maxRead+1))
+	if err != nil {
+		return 0, err
+	}
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(chunk), r.Body))
+	if int64(len(chunk)) > maxRead {
+		chunk = chunk[:maxRead]
+	}
+	vals, err := url.ParseQuery(string(chunk))
+	if err != nil {
+		return 0, err
+	}
+	return countQueryParams(vals), nil
+}
+
+func pathMatchesAny(reqPath string, globs []string) bool {
+	for _, g := range globs {
+		if matchPath(g, reqPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func rateKey(mode, ip, routeGroup string) string {
+	switch mode {
+	case "ip":
+		return ip
+	default:
+		return ip + ":" + routeGroup
+	}
 }
 
 func matchPath(glob string, p string) bool {
@@ -629,6 +981,10 @@ type requestContext struct {
 	ChallengeApplied bool
 	RateLimited      bool
 	Blocked          bool
+	WAFBlocked       bool
+	WAFScore         int
+	WAFRules         []string
+	WAFReason        string
 	Status           int
 }
 
@@ -712,6 +1068,21 @@ func applyEnv(cfg *config.Config) {
 			cfg.Limits.MaxBodyBytes = n
 		}
 	}
+	if v := os.Getenv("MAX_URI_BYTES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.MaxURIBytes = n
+		}
+	}
+	if v := os.Getenv("MAX_QUERY_BYTES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.MaxQueryBytes = n
+		}
+	}
+	if v := os.Getenv("MAX_PARAMS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.MaxParams = n
+		}
+	}
 	if v := os.Getenv("MAX_HEADER_BYTES"); v != "" {
 		if n, err := parseInt(v); err == nil {
 			cfg.Limits.MaxHeaderBytes = n
@@ -747,6 +1118,26 @@ func applyEnv(cfg *config.Config) {
 			cfg.Limits.BanSeconds = n
 		}
 	}
+	if v := os.Getenv("RATE_429_BAN_AFTER"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.Rate429BanAfter = n
+		}
+	}
+	if v := os.Getenv("RATE_429_WINDOW_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.Rate429WindowSec = n
+		}
+	}
+	if v := os.Getenv("RATE_429_BAN_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.Rate429BanSec = n
+		}
+	}
+	if v := os.Getenv("WAF_BAN_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.Limits.WAFBanSec = n
+		}
+	}
 	if v := os.Getenv("CHALLENGE_TTL"); v != "" {
 		if n, err := parseInt(v); err == nil {
 			cfg.Challenge.CookieTTLSeconds = n
@@ -760,6 +1151,74 @@ func applyEnv(cfg *config.Config) {
 	}
 	if v := os.Getenv("CHALLENGE_ENABLED"); v != "" {
 		cfg.Challenge.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("WAF_ENABLED"); v != "" {
+		cfg.WAF.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("WAF_MODE"); v != "" {
+		cfg.WAF.Mode = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("WAF_SCORE_THRESHOLD"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.ScoreThreshold = n
+		}
+	}
+	if v := os.Getenv("WAF_INBOUND_THRESHOLD"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.InboundThreshold = n
+		}
+	}
+	if v := os.Getenv("WAF_PARANOIA_LEVEL"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.ParanoiaLevel = n
+		}
+	}
+	if v := os.Getenv("WAF_MAX_INSPECT_BYTES"); v != "" {
+		if n, err := parseInt64(v); err == nil {
+			cfg.WAF.MaxInspectBytes = n
+		}
+	}
+	if v := os.Getenv("WAF_MAX_VALUES_PER_COLLECTION"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.MaxValuesPerCollection = n
+		}
+	}
+	if v := os.Getenv("WAF_MAX_TOTAL_VALUES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.MaxTotalValues = n
+		}
+	}
+	if v := os.Getenv("WAF_MAX_JSON_VALUES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.MaxJSONValues = n
+		}
+	}
+	if v := os.Getenv("WAF_MAX_BODY_VALUES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.WAF.MaxBodyValues = n
+		}
+	}
+	if v := os.Getenv("WAF_ALLOWED_METHODS"); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, strings.ToUpper(p))
+			}
+		}
+		cfg.WAF.AllowedMethods = out
+	}
+	if v := os.Getenv("WAF_BLOCKED_CONTENT_TYPES"); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		cfg.WAF.BlockedContentTypes = out
 	}
 }
 
