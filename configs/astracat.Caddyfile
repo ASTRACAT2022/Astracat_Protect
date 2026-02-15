@@ -1,0 +1,29 @@
+# Example config matching the spec
+
+log {
+    output stdout
+    format json
+}
+
+panel.astracat.ru {
+    reverse_proxy 172.18.0.4:3000
+}
+
+cabinet.astracat.ru {
+    route {
+        @api path /api/*
+        handle @api {
+            uri strip_prefix /api
+            reverse_proxy remnawave_bot:8080
+        }
+
+        @ws path /cabinet/ws*
+        handle @ws {
+            reverse_proxy remnawave_bot:8080
+        }
+
+        handle {
+            reverse_proxy cabinet_frontend:80
+        }
+    }
+}
