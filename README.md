@@ -1,6 +1,6 @@
 # ASTRACAT PROTECT
 
-Reverse-proxy / edge-gateway with Auto-HTTPS, L7 protections, and metrics.
+Reverse-proxy / edge-gateway with Auto-HTTPS, L7, WAF ,protections, and metrics.
 
 ## Быстрый старт
 
