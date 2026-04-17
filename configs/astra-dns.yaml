@@ -71,8 +71,26 @@ waf:
     - /healthz
     - /metrics
 
+auto_shield:
+  # Global default for all hosts.
+  # Set false to enable only for selected domains via servers[].auto_shield_enabled.
+  enabled: true
+  window_seconds: 60
+  min_requests: 40
+  probe_path_threshold: 20
+  high_error_ratio_pct: 80
+  high_rate_limited_ratio_pct: 40
+  score_threshold: 8
+  ban_seconds: 600
+
 servers:
   - hostname: dns.astracat.ru
+    # Optional per-host override for auto_shield (true/false).
+    # auto_shield_enabled: true
+    # Optional custom certificate for this domain:
+    # tls:
+    #   cert_file: /etc/ssl/dns.astracat.ru/fullchain.pem
+    #   key_file: /etc/ssl/dns.astracat.ru/privkey.pem
     handles:
       - matcher_name: doh
         matcher:

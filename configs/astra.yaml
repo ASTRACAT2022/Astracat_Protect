@@ -91,8 +91,26 @@ waf:
       - waf-pl3-obfuscated-js
   # rules: [] # optional custom rules (id, pattern, targets, score, phase, action, paranoia, transforms)
 
+auto_shield:
+  # Global default for all hosts.
+  # Set false to enable only for selected domains via servers[].auto_shield_enabled.
+  enabled: true
+  window_seconds: 60
+  min_requests: 25
+  probe_path_threshold: 18
+  high_error_ratio_pct: 70
+  high_rate_limited_ratio_pct: 35
+  score_threshold: 7
+  ban_seconds: 900
+
 servers:
   - hostname: panel.astracat.ru
+    # Optional per-host override for auto_shield (true/false).
+    # auto_shield_enabled: true
+    # Optional custom certificate for this domain (disables ACME for this host):
+    # tls:
+    #   cert_file: /etc/ssl/panel.astracat.ru/fullchain.pem
+    #   key_file: /etc/ssl/panel.astracat.ru/privkey.pem
     handles:
       - upstream: 172.18.0.4:3000
 

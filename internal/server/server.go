@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"astracat-protect/internal/autoshield"
 	"astracat-protect/internal/challenge"
 	"astracat-protect/internal/config"
 	"astracat-protect/internal/limits"
@@ -41,6 +43,7 @@ type Options struct {
 type runtime struct {
 	handler atomic.Value
 	cfg     atomic.Value
+	tls     atomic.Value
 }
 
 func Run(cfg *config.Config, opts Options) error {
@@ -63,15 +66,11 @@ func Run(cfg *config.Config, opts Options) error {
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
 
-	autocertMgr, err := newAutocert(cfg)
-	if err != nil {
-		return err
-	}
-	httpsSrv.TLSConfig = autocertMgr.TLSConfig()
+	httpsSrv.TLSConfig = rt.dynamicTLSConfig()
 
 	httpSrv := &http.Server{
 		Addr:              opts.HTTPListen,
-		Handler:           autocertMgr.HTTPHandler(http.HandlerFunc(redirectToHTTPS(opts.HTTPSListen))),
+		Handler:           rt.httpHandler(opts.HTTPSListen),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -81,7 +80,7 @@ func Run(cfg *config.Config, opts Options) error {
 
 	adminSrv := &http.Server{
 		Addr:              opts.AdminListen,
-		Handler:           rt.adminHandler(opts.ConfigPath, logr, metricsReg),
+		Handler:           rt.adminHandler(opts.ConfigPath, opts, logr, metricsReg),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
@@ -102,7 +101,7 @@ func Run(cfg *config.Config, opts Options) error {
 		errCh <- adminSrv.ListenAndServe()
 	}()
 
-	err = <-errCh
+	err := <-errCh
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpsSrv.Shutdown(ctx)
@@ -128,12 +127,17 @@ func handleSignals(rt *runtime, opts Options, logr *logging.Logger, metricsReg *
 }
 
 func (rt *runtime) reload(cfg *config.Config, opts Options, logr *logging.Logger, metricsReg *metrics.Registry) error {
+	tlsState, err := newTLSRuntimeState(cfg, opts.HTTPSListen)
+	if err != nil {
+		return err
+	}
 	h, err := newHandler(cfg, logr, metricsReg)
 	if err != nil {
 		return err
 	}
 	rt.handler.Store(h)
 	rt.cfg.Store(cfg)
+	rt.tls.Store(tlsState)
 	return nil
 }
 
@@ -144,7 +148,32 @@ func (rt *runtime) publicHandler(logr *logging.Logger, metricsReg *metrics.Regis
 	})
 }
 
-func (rt *runtime) adminHandler(configPath string, logr *logging.Logger, metricsReg *metrics.Registry) http.Handler {
+func (rt *runtime) httpHandler(httpsListen string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state, _ := rt.tls.Load().(*tlsRuntimeState)
+		if state != nil && state.httpHandler != nil {
+			state.httpHandler.ServeHTTP(w, r)
+			return
+		}
+		redirectToHTTPS(httpsListen)(w, r)
+	})
+}
+
+func (rt *runtime) dynamicTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1", acme.ALPNProto},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			state, _ := rt.tls.Load().(*tlsRuntimeState)
+			if state == nil {
+				return nil, fmt.Errorf("tls runtime is not ready")
+			}
+			return state.getCertificate(hello)
+		},
+	}
+}
+
+func (rt *runtime) adminHandler(configPath string, opts Options, logr *logging.Logger, metricsReg *metrics.Registry) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -166,7 +195,9 @@ func (rt *runtime) adminHandler(configPath string, logr *logging.Logger, metrics
 			return
 		}
 		applyEnv(cfg)
-		if err := rt.reload(cfg, Options{ConfigPath: configPath}, logr, metricsReg); err != nil {
+		reloadOpts := opts
+		reloadOpts.ConfigPath = configPath
+		if err := rt.reload(cfg, reloadOpts, logr, metricsReg); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(err.Error()))
 			return
@@ -186,13 +217,98 @@ func authorized(r *http.Request) bool {
 	return auth == "Bearer "+token
 }
 
-func newAutocert(cfg *config.Config) (*autocert.Manager, error) {
-	if cfg.ACME.Email == "" {
-		return nil, fmt.Errorf("ACME_EMAIL is required")
+type tlsRuntimeState struct {
+	httpHandler http.Handler
+	autocert    *autocert.Manager
+	certByHost  map[string]*tls.Certificate
+	defaultCert *tls.Certificate
+}
+
+func newTLSRuntimeState(cfg *config.Config, httpsListen string) (*tlsRuntimeState, error) {
+	state := &tlsRuntimeState{
+		certByHost: map[string]*tls.Certificate{},
 	}
-	var hosts []string
+
+	acmeHosts := make([]string, 0, len(cfg.Servers))
 	for _, srv := range cfg.Servers {
-		hosts = append(hosts, srv.Hostname)
+		host := normalizeHost(srv.Hostname)
+		if host == "" {
+			continue
+		}
+		if srv.TLS == nil {
+			acmeHosts = append(acmeHosts, host)
+			continue
+		}
+		certPath := strings.TrimSpace(srv.TLS.CertFile)
+		keyPath := strings.TrimSpace(srv.TLS.KeyFile)
+		if certPath == "" || keyPath == "" {
+			return nil, fmt.Errorf("server %s: tls cert_file and key_file are required together", srv.Hostname)
+		}
+		pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("server %s: cannot load certificate pair: %w", srv.Hostname, err)
+		}
+		state.certByHost[host] = &pair
+		if state.defaultCert == nil {
+			state.defaultCert = &pair
+		}
+	}
+
+	redirect := http.HandlerFunc(redirectToHTTPS(httpsListen))
+	acmeMgr, err := newAutocert(cfg, acmeHosts)
+	if err != nil {
+		return nil, err
+	}
+	state.autocert = acmeMgr
+	if acmeMgr != nil {
+		state.httpHandler = acmeMgr.HTTPHandler(redirect)
+	} else {
+		state.httpHandler = redirect
+	}
+	return state, nil
+}
+
+func (s *tlsRuntimeState) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if s == nil {
+		return nil, fmt.Errorf("tls runtime is not initialized")
+	}
+
+	host := normalizeHost(hello.ServerName)
+	if cert := s.lookupCustomCert(host); cert != nil {
+		return cert, nil
+	}
+	if s.autocert != nil {
+		return s.autocert.GetCertificate(hello)
+	}
+	if s.defaultCert != nil {
+		return s.defaultCert, nil
+	}
+	return nil, fmt.Errorf("no certificate configured for host %q", host)
+}
+
+func (s *tlsRuntimeState) lookupCustomCert(host string) *tls.Certificate {
+	if s == nil || host == "" {
+		return nil
+	}
+	if cert, ok := s.certByHost[host]; ok {
+		return cert
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) > 2 {
+		wildcard := "*." + strings.Join(parts[1:], ".")
+		if cert, ok := s.certByHost[wildcard]; ok {
+			return cert
+		}
+	}
+	return nil
+}
+
+func newAutocert(cfg *config.Config, hosts []string) (*autocert.Manager, error) {
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+	if cfg.ACME.Email == "" {
+		return nil, fmt.Errorf("ACME_EMAIL is required for hosts without custom tls certs: %s", strings.Join(hosts, ","))
 	}
 	mgr := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
@@ -210,6 +326,15 @@ func newAutocert(cfg *config.Config) (*autocert.Manager, error) {
 	return mgr, nil
 }
 
+func normalizeHost(v string) string {
+	h := strings.ToLower(strings.TrimSpace(v))
+	h = strings.TrimSuffix(h, ".")
+	if idx := strings.Index(h, ":"); idx != -1 {
+		h = h[:idx]
+	}
+	return h
+}
+
 type handler struct {
 	proxies            map[string]*proxy.UpstreamProxy
 	hosts              map[string][]routeHandle
@@ -220,6 +345,9 @@ type handler struct {
 	risk               *challenge.RiskTracker
 	challenge          *challenge.Manager
 	challengeEx        []string
+	autoShield         *autoshield.Engine
+	autoShieldDefault  bool
+	autoShieldByHost   map[string]bool
 	waf                *waf.Engine
 	wafEx              []string
 	wafExHosts         map[string]struct{}
@@ -251,7 +379,16 @@ type routeHandle struct {
 func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Registry) (*handler, error) {
 	proxies := map[string]*proxy.UpstreamProxy{}
 	hosts := map[string][]routeHandle{}
+	autoShieldByHost := map[string]bool{}
+	autoShieldHasEnabledOverride := false
 	for _, srv := range cfg.Servers {
+		host := normalizeHost(srv.Hostname)
+		if srv.AutoShieldEnabled != nil && host != "" {
+			autoShieldByHost[host] = *srv.AutoShieldEnabled
+			if *srv.AutoShieldEnabled {
+				autoShieldHasEnabledOverride = true
+			}
+		}
 		var handles []routeHandle
 		for _, h := range srv.Handles {
 			p, ok := proxies[h.Upstream]
@@ -271,7 +408,7 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 				matcherName: h.MatcherName,
 			})
 		}
-		hosts[strings.ToLower(srv.Hostname)] = handles
+		hosts[host] = handles
 	}
 
 	secret := make([]byte, 32)
@@ -348,6 +485,17 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		}
 	}
 
+	autoShieldEngine := autoshield.New(autoshield.Config{
+		Enabled:                 cfg.AutoShield.Enabled || autoShieldHasEnabledOverride,
+		WindowSeconds:           cfg.AutoShield.WindowSeconds,
+		MinRequests:             cfg.AutoShield.MinRequests,
+		ProbePathThreshold:      cfg.AutoShield.ProbePathThreshold,
+		HighErrorRatioPct:       cfg.AutoShield.HighErrorRatioPct,
+		HighRateLimitedRatioPct: cfg.AutoShield.HighRateLimitedRatioPct,
+		ScoreThreshold:          cfg.AutoShield.ScoreThreshold,
+		BanSeconds:              cfg.AutoShield.BanSeconds,
+	})
+
 	defaultRatePenalty := limits.NewPenaltyBox(
 		cfg.Limits.Rate429BanAfter,
 		time.Duration(cfg.Limits.Rate429WindowSec)*time.Second,
@@ -403,6 +551,9 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		),
 		challenge:          challengeMgr,
 		challengeEx:        cfg.Challenge.ExemptGlobs,
+		autoShield:         autoShieldEngine,
+		autoShieldDefault:  cfg.AutoShield.Enabled,
+		autoShieldByHost:   autoShieldByHost,
 		waf:                wafEngine,
 		wafEx:              cfg.WAF.ExemptGlobs,
 		wafExHosts:         wafExHosts,
@@ -445,6 +596,9 @@ func (h *handler) cleanupLoop() {
 		if h.challenge != nil {
 			h.challenge.Cleanup()
 		}
+		if h.autoShield != nil {
+			h.autoShield.Cleanup()
+		}
 	}
 }
 
@@ -454,6 +608,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx := &requestContext{}
 	rec := &responseRecorder{ResponseWriter: w, status: 0}
+	requestPath := r.URL.Path
+	requestHost := normalizeHost(r.Host)
+	ip := limits.ClientIP(r.RemoteAddr)
+	isTrustedIP := h.allowlist.Contains(ip)
+	autoShieldEnabled := h.autoShieldEnabledForHost(requestHost)
 	defer func() {
 		if ctx.Status == 0 {
 			ctx.Status = rec.status
@@ -467,6 +626,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.ObserveLatency(time.Since(start))
 		if ctx.Status >= 500 {
 			atomic.AddUint64(&h.metrics.UpstreamErrors, 1)
+		}
+		if !isTrustedIP && !isACMEPath(requestPath) && autoShieldEnabled && h.autoShield != nil && h.autoShield.Enabled() {
+			decision := h.autoShield.Observe(autoshield.ObserveInput{
+				IP:                ip,
+				Path:              requestPath,
+				Status:            ctx.Status,
+				Blocked:           ctx.Blocked,
+				RateLimited:       ctx.RateLimited,
+				WAFBlocked:        ctx.WAFBlocked,
+				HasUserAgent:      strings.TrimSpace(r.UserAgent()) != "",
+				HasAccept:         strings.TrimSpace(r.Header.Get("Accept")) != "",
+				HasAcceptLanguage: strings.TrimSpace(r.Header.Get("Accept-Language")) != "",
+			})
+			if decision.Banned {
+				h.risk.Penalize(ip, 3)
+				if h.globalRatePenalty != nil {
+					if d := time.Until(decision.Until); d > 0 {
+						h.globalRatePenalty.RegisterBan(ip, d)
+					}
+				}
+			}
 		}
 		h.finishLog(rec, r, ctx, start)
 	}()
@@ -484,9 +664,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := limits.ClientIP(r.RemoteAddr)
-	isTrustedIP := h.allowlist.Contains(ip)
-
 	if !isTrustedIP {
 		if status, reason := h.checkProtocolLimits(r); status != 0 {
 			ctx.Blocked = true
@@ -496,8 +673,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !isACMEPath(r.URL.Path) {
+	if !isACMEPath(requestPath) {
 		if !isTrustedIP {
+			if autoShieldEnabled && h.autoShield != nil && h.autoShield.Enabled() {
+				if banned, until, reason := h.autoShield.IsBanned(ip); banned {
+					ctx.Blocked = true
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, fmt.Sprintf("%s until %s", reason, until.UTC().Format(time.RFC3339)))
+					return
+				}
+			}
 			if h.globalRatePenalty != nil {
 				if banned, until := h.globalRatePenalty.IsBanned(ip); banned {
 					ctx.Blocked = true
@@ -517,7 +701,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isTrustedIP {
-			allowed, policyName, penaltyUntil := h.allowByRatePolicies(ip, r.URL.Path)
+			allowed, policyName, penaltyUntil := h.allowByRatePolicies(ip, requestPath)
 			if !allowed {
 				ctx.RateLimited = true
 				if policyName != "" {
@@ -566,8 +750,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !isTrustedIP {
 			h.risk.UpdateRequest(ip, r)
 		}
-		if !isTrustedIP && h.waf != nil && h.waf.Enabled() && !isExemptPath(r.URL.Path, h.wafEx) && !h.isWAFHostExempt(r.Host) {
-			decision, err := h.waf.Inspect(r, &waf.InspectOptions{SkipRuleIDs: h.wafRuleExclusionsForPath(r.URL.Path)})
+		if !isTrustedIP && h.waf != nil && h.waf.Enabled() && !isExemptPath(requestPath, h.wafEx) && !h.isWAFHostExempt(r.Host) {
+			decision, err := h.waf.Inspect(r, &waf.InspectOptions{SkipRuleIDs: h.wafRuleExclusionsForPath(requestPath)})
 			if err == nil && decision.Matched {
 				ctx.WAFScore = decision.Score
 				ctx.WAFRules = decision.RuleIDs
@@ -600,7 +784,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.routeRequest(rec, r, ctx)
-	if !isACMEPath(r.URL.Path) && !isTrustedIP {
+	if !isACMEPath(requestPath) && !isTrustedIP {
 		h.risk.UpdateStatus(ip, rec.status)
 	}
 }
@@ -611,10 +795,7 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 		return
 	}
 
-	host := strings.ToLower(r.Host)
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
+	host := normalizeHost(r.Host)
 
 	handles := h.hosts[host]
 	if handles == nil {
@@ -864,12 +1045,37 @@ func (h *handler) isWAFHostExempt(host string) bool {
 	if len(h.wafExHosts) == 0 {
 		return false
 	}
-	v := strings.ToLower(strings.TrimSpace(host))
-	if idx := strings.Index(v, ":"); idx != -1 {
-		v = v[:idx]
-	}
+	v := normalizeHost(host)
 	_, ok := h.wafExHosts[v]
 	return ok
+}
+
+func (h *handler) autoShieldEnabledForHost(host string) bool {
+	if h == nil {
+		return false
+	}
+	v := normalizeHost(host)
+	if enabled, ok := lookupHostBoolOverride(v, h.autoShieldByHost); ok {
+		return enabled
+	}
+	return h.autoShieldDefault
+}
+
+func lookupHostBoolOverride(host string, values map[string]bool) (bool, bool) {
+	if host == "" || len(values) == 0 {
+		return false, false
+	}
+	if v, ok := values[host]; ok {
+		return v, true
+	}
+	parts := strings.Split(host, ".")
+	for i := 1; i < len(parts)-1; i++ {
+		key := "*." + strings.Join(parts[i:], ".")
+		if v, ok := values[key]; ok {
+			return v, true
+		}
+	}
+	return false, false
 }
 
 func bytesIn(r *http.Request) int64 {
@@ -1256,6 +1462,44 @@ func applyEnv(cfg *config.Config) {
 			}
 		}
 		cfg.WAF.BlockedContentTypes = out
+	}
+	if v := os.Getenv("AUTO_SHIELD_ENABLED"); v != "" {
+		cfg.AutoShield.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("AUTO_SHIELD_WINDOW_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.WindowSeconds = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_MIN_REQUESTS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.MinRequests = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_PROBE_PATH_THRESHOLD"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.ProbePathThreshold = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_HIGH_ERROR_RATIO_PCT"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.HighErrorRatioPct = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_HIGH_RATE_LIMIT_RATIO_PCT"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.HighRateLimitedRatioPct = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_SCORE_THRESHOLD"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.ScoreThreshold = n
+		}
+	}
+	if v := os.Getenv("AUTO_SHIELD_BAN_SECONDS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AutoShield.BanSeconds = n
+		}
 	}
 }
 

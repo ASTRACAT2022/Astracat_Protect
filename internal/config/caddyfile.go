@@ -101,6 +101,29 @@ func LoadCaddyfile(path string) (*Config, error) {
 				currentCtx = ctxRoute
 				continue
 			}
+			if strings.HasPrefix(line, "auto_shield ") {
+				parts := strings.Fields(line)
+				if len(parts) != 2 {
+					return nil, fmt.Errorf("line %d: auto_shield requires on/off value", lineNo)
+				}
+				v, ok := parseBoolDirective(parts[1])
+				if !ok {
+					return nil, fmt.Errorf("line %d: auto_shield must be on/off/true/false/1/0", lineNo)
+				}
+				currentServer.AutoShieldEnabled = &v
+				continue
+			}
+			if strings.HasPrefix(line, "tls ") {
+				parts := strings.Fields(line)
+				if len(parts) != 3 {
+					return nil, fmt.Errorf("line %d: tls requires cert_file and key_file", lineNo)
+				}
+				currentServer.TLS = &ServerTLS{
+					CertFile: parts[1],
+					KeyFile:  parts[2],
+				}
+				continue
+			}
 			if line == "log {" {
 				currentCtx = ctxLog
 				continue
@@ -207,6 +230,17 @@ func LoadCaddyfile(path string) (*Config, error) {
 	return cfg, nil
 }
 
+func parseBoolDirective(v string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true, true
+	case "0", "false", "off", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 func defaultConfig() *Config {
 	return &Config{
 		Log:  LogConfig{Output: "stdout", Format: "console"},
@@ -252,17 +286,17 @@ func defaultConfig() *Config {
 			},
 		},
 		WAF: WAFConfig{
-			Enabled:          false,
-			Mode:             "block",
-			ScoreThreshold:   7,
-			InboundThreshold: 7,
-			ParanoiaLevel:    1,
-			MaxInspectBytes:  64 << 10,
+			Enabled:                false,
+			Mode:                   "block",
+			ScoreThreshold:         7,
+			InboundThreshold:       7,
+			ParanoiaLevel:          1,
+			MaxInspectBytes:        64 << 10,
 			MaxValuesPerCollection: 200,
-			MaxTotalValues:   500,
-			MaxJSONValues:    300,
-			MaxBodyValues:    300,
-			AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"},
+			MaxTotalValues:         500,
+			MaxJSONValues:          300,
+			MaxBodyValues:          300,
+			AllowedMethods:         []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"},
 			BlockedContentTypes: []string{
 				`application/x-java-serialized-object`,
 			},
@@ -274,7 +308,17 @@ func defaultConfig() *Config {
 			ExemptHosts:         []string{},
 			ExemptRuleIDs:       []string{},
 			ExemptRuleIDsByGlob: map[string][]string{},
-			Rules: nil,
+			Rules:               nil,
+		},
+		AutoShield: AutoShieldConfig{
+			Enabled:                 false,
+			WindowSeconds:           60,
+			MinRequests:             25,
+			ProbePathThreshold:      18,
+			HighErrorRatioPct:       70,
+			HighRateLimitedRatioPct: 35,
+			ScoreThreshold:          7,
+			BanSeconds:              900,
 		},
 	}
 }

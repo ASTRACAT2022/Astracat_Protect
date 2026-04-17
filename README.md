@@ -85,11 +85,62 @@ WAF:
 - `WAF_BLOCKED_CONTENT_TYPES` (comma-separated regex fragments)
 - `waf.exempt_globs`, `waf.exempt_hosts`, `waf.exempt_rule_ids`, `waf.exempt_rule_ids_by_glob` in YAML for precise production exceptions
 
+Auto Shield (fully automatic adaptive protection):
+- `AUTO_SHIELD_ENABLED` (true/1)
+- `AUTO_SHIELD_WINDOW_SECONDS`
+- `AUTO_SHIELD_MIN_REQUESTS`
+- `AUTO_SHIELD_PROBE_PATH_THRESHOLD`
+- `AUTO_SHIELD_HIGH_ERROR_RATIO_PCT`
+- `AUTO_SHIELD_HIGH_RATE_LIMIT_RATIO_PCT`
+- `AUTO_SHIELD_SCORE_THRESHOLD`
+- `AUTO_SHIELD_BAN_SECONDS`
+- `servers[].auto_shield_enabled` in YAML overrides global mode for specific host
+
 ## Notes
 
 - HTTP-01 challenges are served directly by the ACME handler and bypass challenge/rate-limit.
 - Use a persistent volume mounted to `/data` to store ACME state.
 - WAF uses anomaly-scoring with paranoia levels, rule actions (`score|log|allow|block`) and built-in signatures.
+- `auto_shield.enabled: true` enables automatic behavior analysis + adaptive bans with safe defaults.
+
+## Custom TLS Certificates Per Domain
+
+Use YAML and set TLS files under required host:
+
+```yaml
+servers:
+  - hostname: panel.example.com
+    tls:
+      cert_file: /etc/ssl/panel.example.com/fullchain.pem
+      key_file: /etc/ssl/panel.example.com/privkey.pem
+    handles:
+      - upstream: panel:3000
+```
+
+Behavior:
+- If `servers[].tls` is set, this host uses your certificate via SNI.
+- Hosts without `tls` continue to use ACME automatically.
+- `acme.email` is required only for hosts that still use ACME.
+
+## Auto Shield Per Domain
+
+If you want protection only for selected domains:
+
+```yaml
+auto_shield:
+  enabled: false # global default
+
+servers:
+  - hostname: panel.example.com
+    auto_shield_enabled: true
+    handles:
+      - upstream: panel:3000
+
+  - hostname: static.example.com
+    auto_shield_enabled: false
+    handles:
+      - upstream: static:80
+```
 
 
 ## Routing matchers

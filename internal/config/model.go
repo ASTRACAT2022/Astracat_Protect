@@ -1,17 +1,27 @@
 package config
 
 type Config struct {
-	Log       LogConfig       `yaml:"log"`
-	ACME      ACMEConfig      `yaml:"acme"`
-	Limits    LimitsConfig    `yaml:"limits"`
-	Challenge ChallengeConfig `yaml:"challenge"`
-	WAF       WAFConfig       `yaml:"waf"`
-	Servers   []Server        `yaml:"servers"`
+	Log        LogConfig        `yaml:"log"`
+	ACME       ACMEConfig       `yaml:"acme"`
+	Limits     LimitsConfig     `yaml:"limits"`
+	Challenge  ChallengeConfig  `yaml:"challenge"`
+	WAF        WAFConfig        `yaml:"waf"`
+	AutoShield AutoShieldConfig `yaml:"auto_shield"`
+	Servers    []Server         `yaml:"servers"`
 }
 
 type Server struct {
-	Hostname string   `yaml:"hostname"`
-	Handles  []Handle `yaml:"handles"`
+	Hostname string     `yaml:"hostname"`
+	TLS      *ServerTLS `yaml:"tls"`
+	// AutoShieldEnabled overrides global auto_shield.enabled for this hostname.
+	// nil means "use global setting".
+	AutoShieldEnabled *bool    `yaml:"auto_shield_enabled"`
+	Handles           []Handle `yaml:"handles"`
+}
+
+type ServerTLS struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 type Handle struct {
@@ -114,4 +124,15 @@ type WAFRule struct {
 	Action      string   `yaml:"action"`
 	Paranoia    int      `yaml:"paranoia"`
 	Transforms  []string `yaml:"transforms"`
+}
+
+type AutoShieldConfig struct {
+	Enabled                 bool `yaml:"enabled"`
+	WindowSeconds           int  `yaml:"window_seconds"`
+	MinRequests             int  `yaml:"min_requests"`
+	ProbePathThreshold      int  `yaml:"probe_path_threshold"`
+	HighErrorRatioPct       int  `yaml:"high_error_ratio_pct"`
+	HighRateLimitedRatioPct int  `yaml:"high_rate_limited_ratio_pct"`
+	ScoreThreshold          int  `yaml:"score_threshold"`
+	BanSeconds              int  `yaml:"ban_seconds"`
 }

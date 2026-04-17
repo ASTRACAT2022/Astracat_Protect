@@ -6,8 +6,10 @@
 
 Он делает:
 - TLS/HTTPS (ACME/Let's Encrypt) на входе;
+- поддержку своих SSL-сертификатов для конкретных доменов (SNI);
 - HTTP->HTTPS redirect;
 - L7-защиту (rate limit, challenge, ban);
+- автоматический адаптивный anti-abuse модуль `auto_shield`;
 - маршрутизацию по домену и пути;
 - логи и метрики;
 - hot-reload конфига без полного рестарта.
@@ -23,8 +25,9 @@
 1. `ASTRACAT PROTECT` слушает `80/443`, принимает весь внешний трафик.
 2. Выпускает/обновляет сертификаты в `/data/acme`.
 3. Применяет защиту (challenge, лимиты, бан).
-4. Проксирует в upstream-сервисы по `astra.yaml`.
-5. Отдает `/metrics`, `/healthz`, и admin `/reload`.
+4. При необходимости использует ваш cert/key для выбранных доменов.
+5. Проксирует в upstream-сервисы по `astra.yaml`.
+6. Отдает `/metrics`, `/healthz`, и admin `/reload`.
 
 ---
 
@@ -33,7 +36,7 @@
 1. DNS доменов указывает на IP сервера.
 2. Порты `80/tcp` и `443/tcp` открыты на сервере.
 3. Docker установлен и работает.
-4. Указан рабочий email для ACME.
+4. Указан рабочий email для ACME (если есть домены без `servers[].tls`).
 5. Backend контейнеры доступны ASTRACAT по Docker DNS.
 
 ---
@@ -143,8 +146,18 @@ challenge:
     - "*.png"
     - "*.woff2"
 
+auto_shield:
+  enabled: true
+  # Остальные поля можно не задавать: используются прод-безопасные дефолты.
+
 servers:
   - hostname: panel.astracat.ru
+    # Переопределение auto_shield только для этого домена:
+    # auto_shield_enabled: true
+    # Для своего сертификата укажите:
+    # tls:
+    #   cert_file: /etc/ssl/panel.astracat.ru/fullchain.pem
+    #   key_file: /etc/ssl/panel.astracat.ru/privkey.pem
     handles:
       - upstream: 172.18.0.4:3000
 
@@ -275,12 +288,46 @@ docker logs --since=2m astracat-protect | grep "cabinet.astracat.ru" | tail -n 3
 1. `Rate limiting` по IP (token bucket): `rps`, `burst`.
 2. `Connection limit` по IP: `conn_limit`, `ws_conn_limit`.
 3. `Risk scoring` с TTL.
-4. При превышении порога:
+4. `Auto Shield` (если `auto_shield.enabled: true`) автоматически анализирует поведение клиента и адаптивно банит атакующий трафик без ручной настройки правил.
+5. При превышении порога:
 - interstitial (`Checking your browser...`);
 - captcha;
 - cookie clearance.
-5. Если лимит нарушен `ban_after` раз:
+6. Если лимит нарушен `ban_after` раз:
 - IP бан на `ban_seconds`.
+
+### 11.1 Включение `auto_shield` только на отдельных доменах
+
+Если нужно, чтобы авто-защита работала только на части доменов:
+
+```yaml
+auto_shield:
+  enabled: false  # глобально выключено
+
+servers:
+  - hostname: panel.example.com
+    auto_shield_enabled: true
+    handles:
+      - upstream: panel:3000
+
+  - hostname: static.example.com
+    auto_shield_enabled: false
+    handles:
+      - upstream: static:80
+```
+
+Пояснение:
+- `auto_shield.enabled` — глобальный дефолт;
+- `servers[].auto_shield_enabled` — переопределение только для конкретного хоста.
+
+Для Caddyfile-формата в блоке хоста можно указать:
+
+```caddyfile
+panel.example.com {
+    auto_shield on
+    reverse_proxy panel:3000
+}
+```
 
 ---
 
@@ -454,4 +501,3 @@ docker logs -f astracat-protect
 ```bash
 curl -kI --resolve cabinet.astracat.ru:443:127.0.0.1 https://cabinet.astracat.ru/
 ```
-

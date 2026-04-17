@@ -5,7 +5,7 @@
 - Домены должны смотреть на IP сервера (A/AAAA записи).
 - Открыты порты `80/tcp` и `443/tcp`.
 - На сервере установлен Docker.
-- Для ACME обязателен email (`ACME_EMAIL`).
+- Для ACME обязателен email (`ACME_EMAIL`) только для доменов без `servers[].tls`.
 
 ## 2) Структура на сервере
 
@@ -68,8 +68,18 @@ challenge:
     - '*.png'
     - '*.woff2'
 
+auto_shield:
+  enabled: true
+  # Остальные параметры можно не трогать — безопасные значения по умолчанию.
+
 servers:
   - hostname: panel.astracat.ru
+    # Можно включить/выключить auto_shield только для этого домена:
+    # auto_shield_enabled: true
+    # Если нужен свой сертификат для этого домена:
+    # tls:
+    #   cert_file: /etc/ssl/panel.astracat.ru/fullchain.pem
+    #   key_file: /etc/ssl/panel.astracat.ru/privkey.pem
     handles:
       - upstream: 172.18.0.4:3000
 

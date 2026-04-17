@@ -29,10 +29,17 @@ ADMIN_TOKEN=changeme ./bin/astracat-protect -config ./configs/astra.yaml -http :
 - `limits` — лимиты и risk scoring
 - `challenge` — антибот‑проверка
 - `waf` — сигнатурный WAF (режим block/log, scoring, исключения)
+- `auto_shield` — полностью автоматический адаптивный анализатор трафика (включается флагом `enabled`)
 - `servers` — маршрутизация (хосты, matchers, strip_prefix, upstream)
+- `servers[].auto_shield_enabled` — переопределение auto_shield для конкретного домена
+
+Для своего сертификата на конкретный домен:
+- в `servers[].tls.cert_file` укажите путь к `fullchain.pem`
+- в `servers[].tls.key_file` укажите путь к `privkey.pem`
+- если `tls` не задан, домен работает через ACME как раньше
 
 Обязательное:
-- `acme.email` должен быть реальным, иначе ACME не стартует.
+- `acme.email` должен быть реальным, если есть хотя бы один домен без `servers[].tls`.
 
 ## Порты
 
@@ -97,6 +104,16 @@ WAF:
 - `WAF_MAX_BODY_VALUES`
 - `WAF_ALLOWED_METHODS` (через запятую)
 - `WAF_BLOCKED_CONTENT_TYPES` (через запятую, regex-фрагменты)
+
+Auto Shield:
+- `AUTO_SHIELD_ENABLED`
+- `AUTO_SHIELD_WINDOW_SECONDS`
+- `AUTO_SHIELD_MIN_REQUESTS`
+- `AUTO_SHIELD_PROBE_PATH_THRESHOLD`
+- `AUTO_SHIELD_HIGH_ERROR_RATIO_PCT`
+- `AUTO_SHIELD_HIGH_RATE_LIMIT_RATIO_PCT`
+- `AUTO_SHIELD_SCORE_THRESHOLD`
+- `AUTO_SHIELD_BAN_SECONDS`
 
 ## Docker 
 
