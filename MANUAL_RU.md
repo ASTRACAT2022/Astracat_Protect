@@ -68,7 +68,7 @@ docker run -d --name astracat-protect \
   -v /opt/astracat-protect/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=seo@astracat.ru \
-  astracat/protect:8 \
+  astracat/protect:latest \
   -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
 ```
 
@@ -413,7 +413,7 @@ cd /path/to/Astracat_Protect
 git pull origin main
 docker build --no-cache -t astracat/protect:8 -t astracat/protect:latest .
 docker login
-docker push astracat/protect:8
+docker push astracat/protect:14
 docker push astracat/protect:latest
 ```
 
@@ -429,7 +429,7 @@ docker run -d --name astracat-protect \
   -v /opt/astracat-protect/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=seo@astracat.ru \
-  astracat/protect:v10 \
+  astracat/protect:latest\
   -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
 ```
 
