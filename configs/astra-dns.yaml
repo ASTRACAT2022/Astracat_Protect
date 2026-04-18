@@ -1,0 +1,151 @@
+log:
+  output: stdout
+  format: json
+
+acme:
+  email: you@example.com
+  ca: ""
+  staging: false
+  key_type: ""
+  renew_window: "720h"
+  storage_path: /data/acme
+  on_demand_tls: false
+  dns01_enabled: true
+  dns_issue_hook: "lego --email you@example.com --dns cloudflare --domains {domain} --path {storage} run && cp {storage}/certificates/{domain}.crt {cert} && cp {storage}/certificates/{domain}.key {key}"
+  dns_renew_hook: "lego --email you@example.com --dns cloudflare --domains {domain} --path {storage} renew --days 30 && cp {storage}/certificates/{domain}.crt {cert} && cp {storage}/certificates/{domain}.key {key}"
+  dns_hook_timeout_seconds: 180
+  dns_storage_path: /data/acme/dns01
+
+http3:
+  enabled: true
+  listen: ":443"
+
+ai:
+  enabled: true
+  learning_mode: false
+  backend: builtin # switch to onnx/tflite with *_command
+  model_path: ""
+  onnx_command: ""
+  tflite_command: ""
+  state_path: /data/ai/state.db
+  min_samples: 100
+  challenge_threshold: 4.5
+  rate_limit_threshold: 6.5
+  block_threshold: 8.5
+  max_body_inspect_bytes: 8192
+  command_timeout_ms: 25
+  update_profiles_on_block: false
+
+threat_intel:
+  enabled: false
+  action: block
+  refresh_seconds: 300
+  ip_feeds: []
+  asn_feeds: []
+  ja3_feeds: []
+  ips: []
+  asns: []
+  ja3: []
+  asn_header: X-ASN
+  ja3_header: X-JA3
+
+bot_management:
+  enabled: true
+  bad_action: rate_limit
+  bypass_waf_for_good: false
+  good_patterns: []
+  bad_patterns: []
+  profiles: []
+
+limits:
+  rps: 2000
+  burst: 4000
+  conn_limit: 20000
+  ws_conn_limit: 20
+  whitelist_ips: []
+  max_body_bytes: 131072
+  max_uri_bytes: 8192
+  max_query_bytes: 8192
+  max_params: 20
+  max_header_bytes: 1048576
+  max_url_length: 2048
+  risk_threshold: 20
+  risk_ttl_seconds: 300
+  risk_status_window: 60
+  ban_after: 50
+  ban_seconds: 600
+  rate_429_ban_after: 200
+  rate_429_window_seconds: 60
+  rate_429_ban_seconds: 60
+  waf_ban_seconds: 60
+  rate_policies:
+    - name: doh
+      path_globs: [/dns-query]
+      rps: 300
+      burst: 600
+      key: ip
+      ban_after_429: 200
+      ban_window_seconds: 60
+      ban_seconds: 60
+
+challenge:
+  enabled: true
+  cookie_ttl_seconds: 1800
+  bind_ip: true
+  bind_ua: false
+  exempt_globs:
+    - /dns-query
+    - /.well-known/acme-challenge/*
+    - /healthz
+    - /metrics
+
+waf:
+  enabled: true
+  mode: block
+  inbound_threshold: 7
+  paranoia_level: 1
+  presets: [wordpress, laravel, nextjs]
+  max_inspect_bytes: 65536
+  max_values_per_collection: 200
+  max_total_values: 500
+  max_json_values: 300
+  max_body_values: 300
+  allowed_methods: [GET, POST, OPTIONS]
+  blocked_content_types:
+    - application/x-java-serialized-object
+  exempt_globs:
+    - /dns-query
+    - /.well-known/acme-challenge/*
+    - /healthz
+    - /metrics
+
+auto_shield:
+  # Global default for all hosts.
+  # Set false to enable only for selected domains via servers[].auto_shield_enabled.
+  enabled: true
+  window_seconds: 60
+  min_requests: 40
+  probe_path_threshold: 20
+  high_error_ratio_pct: 80
+  high_rate_limited_ratio_pct: 40
+  score_threshold: 8
+  ban_seconds: 600
+
+servers:
+  - hostname: dns.astracat.ru
+    # Optional per-host override for auto_shield (true/false).
+    # auto_shield_enabled: true
+    # Optional custom certificate for this domain:
+    # tls:
+    #   cert_file: /etc/ssl/dns.astracat.ru/fullchain.pem
+    #   key_file: /etc/ssl/dns.astracat.ru/privkey.pem
+    handles:
+      - matcher_name: doh
+        matcher:
+          path_exact: /dns-query
+        mode: passthrough
+        lb_policy: round_robin
+        upstreams:
+          - dnsdist:8053
+
+      - upstream: site-frontend:80

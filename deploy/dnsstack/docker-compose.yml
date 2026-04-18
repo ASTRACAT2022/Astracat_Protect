@@ -1,0 +1,67 @@
+version: "3.9"
+
+networks:
+  edge:
+    name: edge
+
+services:
+  protect:
+    image: astracat/protect:3
+    container_name: astracat-protect
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "9090:9090"
+    volumes:
+      - ../../configs/astra-dns.yaml:/app/configs/astra.yaml:ro
+      - ../../data:/data
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-changeme}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    command: ["-config", "/app/configs/astra.yaml", "-http", ":80", "-https", ":443", "-admin", ":9090"]
+
+  dnsdist:
+    image: powerdns/dnsdist-19:latest
+    container_name: dnsdist
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "853:853/tcp"
+    volumes:
+      - ./dnsdist/dnsdist.conf:/etc/dnsdist/dnsdist.conf:ro
+      - ../../certs:/etc/dnsdist/certs:ro
+    depends_on:
+      - unbound
+
+  unbound:
+    image: mvance/unbound:latest
+    container_name: unbound
+    restart: unless-stopped
+    networks: [edge]
+    expose:
+      - "5353/tcp"
+      - "5353/udp"
+    volumes:
+      - ./unbound/unbound.conf:/opt/unbound/etc/unbound/unbound.conf:ro
+
+  healthcheck:
+    image: wbitt/network-multitool:latest
+    container_name: dnsstack-healthcheck
+    restart: unless-stopped
+    networks: [edge]
+    depends_on:
+      - protect
+      - dnsdist
+      - unbound
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://protect:9090/healthz >/dev/null && curl -fsS 'http://dnsdist:8053/dns-query?name=example.com&type=A' >/dev/null && nc -z unbound 5353"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5

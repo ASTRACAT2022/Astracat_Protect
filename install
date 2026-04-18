@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+set -e
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIN_DIR="${ROOT_DIR}/bin"
+OUT_BIN="${BIN_DIR}/astracat-protect"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "Go is required. Install Go 1.24+ and retry." >&2
+  exit 1
+fi
+
+mkdir -p "${BIN_DIR}"
+
+# Use a writable cache if default is locked down
+export GOCACHE="${GOCACHE:-/tmp/go-build}"
+
+# Resolve deps and build
+( cd "${ROOT_DIR}" && go mod tidy )
+( cd "${ROOT_DIR}" && CGO_ENABLED=0 go build -o "${OUT_BIN}" ./cmd/astracat-protect )
+
+cat <<MSG
+Installed locally:
+  ${OUT_BIN}
+
+Run example:
+  ADMIN_TOKEN=changeme ${OUT_BIN} -config ${ROOT_DIR}/configs/astra.yaml -http :80 -https :443 -admin :9090
+MSG
