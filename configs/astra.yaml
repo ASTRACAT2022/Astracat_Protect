@@ -139,6 +139,17 @@ challenge:
     - "*.png"
     - "*.woff2"
 
+websocket:
+  enabled: false               # toggle on to proxy WebSocket upgrades
+  handshake_timeout: 10s
+  read_timeout: 0              # 0 = no cap (recommended for long-lived sessions)
+  write_timeout: 0
+  max_message_bytes: 1048576   # 1 MiB per WebSocket message (incl. fragments)
+  ping_interval: 30s           # 0 disables keep-alive
+  pong_timeout: 30s            # defaults to ping_interval if zero
+  allowed_origins: []          # empty = same-origin only; ["*"] to allow any
+  subprotocols: []
+
 servers:
   - hostname: dns.astracat.ru
     tls:

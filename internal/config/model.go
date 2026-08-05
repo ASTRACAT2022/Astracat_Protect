@@ -11,7 +11,50 @@ type Config struct {
 	WAF           WAFConfig           `yaml:"waf"`
 	AI            AIConfig            `yaml:"ai"`
 	AutoShield    AutoShieldConfig    `yaml:"auto_shield"`
+	WebSocket     WebSocketConfig     `yaml:"websocket"`
 	Servers       []Server            `yaml:"servers"`
+}
+
+// WebSocketConfig configures the WebSocket reverse-proxy.
+// All fields are optional; zero values pick safe defaults.
+// Per-handle overrides live in Handle.WebSocket.
+type WebSocketConfig struct {
+	// Enabled globally toggles WebSocket support. When
+	// false, WebSocket upgrades are passed through to the
+	// regular reverse proxy and will be silently dropped
+	// (this is the historical behaviour of net/http/httputil).
+	Enabled bool `yaml:"enabled"`
+
+	// HandshakeTimeout caps how long the upstream may take
+	// to respond with 101 Switching Protocols. Default 10s.
+	HandshakeTimeout string `yaml:"handshake_timeout"`
+
+	// ReadTimeout / WriteTimeout cap per-frame I/O. Zero
+	// disables. Use generous values for long-lived sessions.
+	ReadTimeout  string `yaml:"read_timeout"`
+	WriteTimeout string `yaml:"write_timeout"`
+
+	// MaxMessageBytes caps a single WebSocket message
+	// (sum of all fragments). Default 1 MiB.
+	MaxMessageBytes int64 `yaml:"max_message_bytes"`
+
+	// PingInterval enables server-to-client keep-alive
+	// pings. 0 disables. Caddy's WebSocket uses 30s.
+	PingInterval string `yaml:"ping_interval"`
+
+	// PongTimeout is the maximum time the peer has to
+	// answer a Ping before the connection is dropped.
+	// Defaults to PingInterval.
+	PongTimeout string `yaml:"pong_timeout"`
+
+	// AllowedOrigins, when non-empty, restricts the
+	// Origin header. "*" allows any origin. An empty list
+	// enforces the same-origin policy.
+	AllowedOrigins []string `yaml:"allowed_origins"`
+
+	// Subprotocols is the list of Sec-WebSocket-Protocol
+	// tokens offered to the upstream.
+	Subprotocols []string `yaml:"subprotocols"`
 }
 
 type Server struct {
@@ -36,6 +79,11 @@ type Handle struct {
 	LBPolicy    string   `yaml:"lb_policy"`
 	Upstream    string   `yaml:"upstream"`
 	Upstreams   []string `yaml:"upstreams"`
+	// WebSocket, when non-nil, overrides the global
+	// WebSocketConfig for this handle. A handle that sets
+	// only Enabled=true inherits all limits from the global
+	// section.
+	WebSocket *WebSocketConfig `yaml:"websocket"`
 }
 
 type Matcher struct {

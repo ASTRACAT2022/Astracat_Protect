@@ -397,6 +397,76 @@ panel.example.com {
 
 ---
 
+### 11.5 WebSocket reverse-proxy (ws:// и wss://)
+
+Astracat умеет проксировать WebSocket-соединения. `httputil.ReverseProxy` из Go не умеет передавать HTTP/1.1 `Connection: Upgrade`, поэтому без явной поддержки WS-апгрейды молча отбрасывались. Теперь при включённой секции `websocket:` прокси сам хайджекит клиента, открывает соединение к upstream, выполняет handshake и прозрачно туннелирует фреймы в обе стороны.
+
+Глобальная секция:
+
+```yaml
+websocket:
+  enabled: true
+  handshake_timeout: 10s
+  read_timeout: 0           # 0 = без лимита (рекомендуется для long-lived сессий)
+  write_timeout: 0
+  max_message_bytes: 1048576   # 1 MiB на сообщение (включая фрагменты)
+  ping_interval: 30s        # 0 = отключить keep-alive
+  pong_timeout: 30s         # по умолчанию = ping_interval
+  allowed_origins:
+    - "https://app.example.com"
+    - "*.example.com"
+  subprotocols:
+    - graphql-ws
+```
+
+Per-handle override (например, разрешить WS только для одного маршрута):
+
+```yaml
+servers:
+  - hostname: api.example.com
+    handles:
+      - matcher_name: ws
+        matcher:
+          path_glob: /ws/*
+        upstream: backend:8080
+        websocket:
+          enabled: true
+          allowed_origins: ["*"]
+          max_message_bytes: 4194304
+```
+
+`websocket.enabled: false` в override **отключает** WS на конкретном маршруте, даже если глобально он включён.
+
+**Origin.** По умолчанию действует same-origin policy: `Origin` должен совпадать с `Host` (включая схему). Это анти-CSRF защита — браузер сам ставит Origin, и подделать его из JS нельзя. Для API без браузера (curl, `ws://` из Go/Python) Origin отсутствует и соединение пропускается. Чтобы разрешить любой origin — `allowed_origins: ["*"]`. Wildcard `*.example.com` разрешает все поддомены.
+
+**Subprotocols.** Значение `subprotocols` из конфига идёт в заголовок `Sec-WebSocket-Protocol` запроса к upstream. Ответ upstream пробрасывается клиенту как есть.
+
+**Метрики.** В `/metrics` добавлены:
+
+- `astracat_ws_active` (gauge) — текущие открытые WS-соединения;
+- `astracat_ws_connections_total` — успешные handshake'и;
+- `astracat_ws_rejected_total` — отказы (Origin/метод/missing key/oversized);
+- `astracat_ws_errors_total` — I/O ошибки после успешного handshake.
+
+Лимит одновременных WS-соединений на IP — `limits.ws_conn_limit` (как и раньше). `limits.rps/burst` действуют только на handshake; фреймы per-peer не лимитируются (иначе WS невозможно использовать).
+
+**Ограничения.**
+
+- Прокси **не** разбирает application-данные фреймов — они идут как opaque bytes. Это соответствует поведению Caddy, Traefik, nginx `proxy_pass` для WS. Валидация содержимого — на стороне upstream.
+- Поддерживается только WebSocket поверх HTTP/1.1 (RFC 6455). WebSocket поверх HTTP/2 (RFC 8441) пока не реализован.
+- `permessage-deflate` (`Sec-WebSocket-Extensions`) не проксируется.
+
+**Проверка.** После включения `websocket.enabled: true`:
+
+```bash
+# используя wscat (npm i -g wscat)
+wscat -c wss://api.example.com/ws
+```
+
+В access-логе handshake пишется обычной строкой. Если всё ок — `status: 101`; иначе — код отказа (`403` Origin, `400` без ключа, `405` не-GET, `502` upstream недоступен).
+
+---
+
 ## 12. Белый список IP
 
 Параметр:

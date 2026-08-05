@@ -9,10 +9,12 @@ High-performance reverse proxy + AI-driven WAF with Auto-HTTPS, HTTP/3, adaptive
 - L7 защиту (WAF, challenge, rate-limit, adaptive bans)
 - routing/balancing до upstream
 - observability (`/healthz`, `/metrics`, structured logs)
+- WebSocket reverse-proxy (ws:// и wss://)
 
 ## Текущий статус
 
 - `HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC)`: реализовано
+- `WebSocket reverse-proxy (ws:// и wss://)`: реализовано — см. раздел "WebSocket"
 - `AI-WAF (builtin + ONNX/TFLite hooks)`: реализовано
 - `DNS-01 automation через hooks`: реализовано
 - `Zero-config bootstrap через env`: реализовано
@@ -89,6 +91,16 @@ docker run -d --name astracat-protect \
 ### HTTP/3
 - `HTTP3_ENABLED`
 - `HTTP3_LISTEN`
+
+### WebSocket
+- `WS_ENABLED` (default `false`)
+- `WS_HANDSHAKE_TIMEOUT` (default `10s`)
+- `WS_READ_TIMEOUT`, `WS_WRITE_TIMEOUT` (default `0` = без лимита)
+- `WS_MAX_MESSAGE_BYTES` (default `1048576`)
+- `WS_PING_INTERVAL` (default `30s`; `0` отключает keep-alive)
+- `WS_PONG_TIMEOUT` (default = `WS_PING_INTERVAL`)
+- `WS_ALLOWED_ORIGINS` (comma-separated; `*` разрешает любой)
+- `WS_SUBPROTOCOLS` (comma-separated)
 
 ### AI-WAF
 - `AI_ENABLED`
@@ -175,6 +187,79 @@ servers:
 ```
 
 `passthrough` отключает защитный pipeline на этом route (WAF/challenge/rate/risk/auto-shield).
+
+## WebSocket
+
+Astracat Protect умеет проксировать WebSocket-соединения (RFC 6455, `ws://` и `wss://`). Стандартный `httputil.ReverseProxy` не проксирует HTTP/1.1 `Connection: Upgrade`, поэтому WebSocket-апгрейды раньше молча терялись. Теперь при наличии секции `websocket:` в конфиге прокси сам хайджекит клиента, открывает соединение к upstream, выполняет handshake и прозрачно туннелирует фреймы в обе стороны.
+
+### Что входит
+
+- Hijack клиентского сокета + проброс handshake к upstream (TCP для `ws://`, TLS для `wss://`).
+- Парсинг WebSocket-фреймов с лимитом `max_message_bytes` (по умолчанию 1 MiB) на сообщение (включая фрагменты).
+- Keep-alive: периодический Ping (`ping_interval`) с настраиваемым `pong_timeout`; клиент, который не отвечает, отключается.
+- Валидация Origin: по умолчанию — same-origin (только совпадение `scheme://host`); задайте `allowed_origins: ["*"]` чтобы разрешить любой, или список конкретных origin'ов.
+- Subprotocols: задаёте `subprotocols: [...]` — заголовок `Sec-WebSocket-Protocol` будет передан upstream, и его ответ проброшен клиенту.
+- Метрики: `astracat_ws_active` (gauge, текущие соединения), `astracat_ws_connections_total`, `astracat_ws_rejected_total`, `astracat_ws_errors_total`.
+- Лимит одновременных WS-соединений на IP: используется существующий `limits.ws_conn_limit` (как и раньше).
+- WAF и весь защитный pipeline работают только на фазе handshake (проверяется Origin/метод/заголовки). После 101 фреймы передаются как opaque bytes — это норма для WS-туннелей.
+
+### Конфигурация
+
+Глобальная секция (применяется ко всем серверам):
+
+```yaml
+websocket:
+  enabled: true
+  handshake_timeout: 10s
+  read_timeout: 0          # 0 = без лимита (рекомендуется для long-lived)
+  write_timeout: 0
+  max_message_bytes: 1048576
+  ping_interval: 30s
+  pong_timeout: 30s
+  allowed_origins:
+    - "https://app.example.com"
+    - "*.example.com"
+  subprotocols:
+    - graphql-ws
+```
+
+Per-handle override (например, разрешить WS только для одного маршрута):
+
+```yaml
+servers:
+  - hostname: api.example.com
+    handles:
+      - matcher_name: ws
+        matcher:
+          path_glob: /ws/*
+        upstream: backend:8080
+        websocket:
+          enabled: true
+          allowed_origins: ["*"]
+          max_message_bytes: 4194304   # 4 MiB для графиков
+```
+
+`websocket.enabled: false` в override **отключает** WS на этом маршруте, даже если глобально он включён.
+
+### Защита от злоупотреблений
+
+- `limits.ws_conn_limit` ограничивает количество **одновременных** WebSocket-соединений на IP (счётчик инкрементируется в момент handshake, декрементируется при закрытии).
+- `limits.rps` / `limits.burst` тоже действуют на handshake, но **не** на сами фреймы (это и не нужно: лимитировать RPS по фреймам = убить WebSocket).
+- WAF exempts (`waf.exempt_globs`) можно использовать, чтобы отключить WAF для `/ws/*` — например, чтобы challenge не мешал установке долгоживущих соединений.
+
+### Метрики и логи
+
+- `astracat_ws_active` — текущее количество открытых WebSocket-соединений.
+- `astracat_ws_connections_total` — успешные handshake'ы.
+- `astracat_ws_rejected_total` — отказы (Origin, oversized, метод, и т.п.).
+- `astracat_ws_errors_total` — ошибки I/O после успешного handshake.
+- В access-логе handshake пишется обычная строка (статус 101 если всё ок, иначе код отказа). Каждый фрейм в логе не пишется — это быстро убьёт диск.
+
+### Ограничения
+
+- Прокси **не** разбирает application-данные WebSocket-фреймов (не парсит JSON, не ищет XSS в payload) — фреймы идут как opaque bytes. Это соответствует поведению nginx `proxy_pass` для WS, Caddy, Traefik, HAProxy. Валидация полезной нагрузки должна быть на стороне upstream.
+- Поддерживается только WebSocket поверх HTTP/1.1 (RFC 6455). WebSocket-поверх-HTTP/2 (RFC 8441) пока не реализован — браузеры почти всегда используют HTTP/1.1 для WS.
+- Per-message-deflate (`Sec-WebSocket-Extensions: permessage-deflate`) не проксируется. Если upstream его использует, клиент и upstream должны договориться без посредника.
 
 ## WAF: что уже есть
 

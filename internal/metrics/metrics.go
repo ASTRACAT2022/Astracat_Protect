@@ -45,6 +45,9 @@ type Registry struct {
 	ChallengeServed  uint64
 	WAFBlocked       uint64
 	WSActive         int64
+	WSConnections    uint64
+	WSRejected       uint64
+	WSErrors         uint64
 	LatencyHistogram *Histogram
 }
 
@@ -75,6 +78,12 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "astracat_waf_blocked_total %d\n", atomic.LoadUint64(&r.WAFBlocked))
 	fmt.Fprintln(w, "# TYPE astracat_ws_active gauge")
 	fmt.Fprintf(w, "astracat_ws_active %d\n", atomic.LoadInt64(&r.WSActive))
+	fmt.Fprintln(w, "# TYPE astracat_ws_connections_total counter")
+	fmt.Fprintf(w, "astracat_ws_connections_total %d\n", atomic.LoadUint64(&r.WSConnections))
+	fmt.Fprintln(w, "# TYPE astracat_ws_rejected_total counter")
+	fmt.Fprintf(w, "astracat_ws_rejected_total %d\n", atomic.LoadUint64(&r.WSRejected))
+	fmt.Fprintln(w, "# TYPE astracat_ws_errors_total counter")
+	fmt.Fprintf(w, "astracat_ws_errors_total %d\n", atomic.LoadUint64(&r.WSErrors))
 
 	buckets, counts := r.LatencyHistogram.Snapshot()
 	fmt.Fprintln(w, "# TYPE astracat_latency_ms histogram")

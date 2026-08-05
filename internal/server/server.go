@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -616,14 +618,28 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 			if len(upstreams) == 0 {
 				return nil, fmt.Errorf("server %s: handle has no upstreams", srv.Hostname)
 			}
+			wsCfg := resolveWSConfig(cfg.WebSocket, h.WebSocket)
 			poolBackends := make([]*proxy.UpstreamProxy, 0, len(upstreams))
 			for _, upstream := range upstreams {
 				p, ok := proxies[upstream]
 				if !ok {
-					proxyInstance, err := proxy.NewUpstreamProxy(upstream, 2*time.Second, 10*time.Second)
+					var (
+						proxyInstance *proxy.UpstreamProxy
+						err           error
+					)
+					if wsCfg != nil {
+						proxyInstance, err = proxy.NewUpstreamProxyWithWS(upstream, 2*time.Second, 10*time.Second, buildProxyWSConfig(*wsCfg))
+					} else {
+						proxyInstance, err = proxy.NewUpstreamProxy(upstream, 2*time.Second, 10*time.Second)
+					}
 					if err != nil {
 						return nil, err
 					}
+					proxyInstance.SetWSMetrics(
+						&metricsReg.WSConnections,
+						&metricsReg.WSRejected,
+						&metricsReg.WSErrors,
+					)
 					proxies[upstream] = proxyInstance
 					p = proxyInstance
 				}
@@ -1778,20 +1794,40 @@ type responseRecorder struct {
 	http.ResponseWriter
 	status int
 	bytes  int
+	hijacked bool
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
+	if r.hijacked {
+		return
+	}
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.hijacked {
+		return len(b), nil
+	}
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
+}
+
+// Hijack delegates to the underlying ResponseWriter so the
+// WebSocket reverse-proxy can take over the connection. It
+// records the fact that the response was hijacked so the
+// recorder stops double-counting bytes/status.
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	r.hijacked = true
+	return h.Hijack()
 }
 
 func redirectToHTTPS(httpsListen string) func(w http.ResponseWriter, r *http.Request) {
@@ -1850,6 +1886,50 @@ func applyEnv(cfg *config.Config) {
 	}
 	if v := os.Getenv("HTTP3_LISTEN"); v != "" {
 		cfg.HTTP3.Listen = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("WS_ENABLED"); v != "" {
+		cfg.WebSocket.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("WS_HANDSHAKE_TIMEOUT"); v != "" {
+		cfg.WebSocket.HandshakeTimeout = v
+	}
+	if v := os.Getenv("WS_READ_TIMEOUT"); v != "" {
+		cfg.WebSocket.ReadTimeout = v
+	}
+	if v := os.Getenv("WS_WRITE_TIMEOUT"); v != "" {
+		cfg.WebSocket.WriteTimeout = v
+	}
+	if v := os.Getenv("WS_MAX_MESSAGE_BYTES"); v != "" {
+		if n, err := parseInt64(v); err == nil {
+			cfg.WebSocket.MaxMessageBytes = n
+		}
+	}
+	if v := os.Getenv("WS_PING_INTERVAL"); v != "" {
+		cfg.WebSocket.PingInterval = v
+	}
+	if v := os.Getenv("WS_PONG_TIMEOUT"); v != "" {
+		cfg.WebSocket.PongTimeout = v
+	}
+	if v := os.Getenv("WS_ALLOWED_ORIGINS"); v != "" {
+		parts := strings.Split(v, ",")
+		items := make([]string, 0, len(parts))
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				items = append(items, trimmed)
+			}
+		}
+		cfg.WebSocket.AllowedOrigins = items
+	}
+	if v := os.Getenv("WS_SUBPROTOCOLS"); v != "" {
+		parts := strings.Split(v, ",")
+		items := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				items = append(items, trimmed)
+			}
+		}
+		cfg.WebSocket.Subprotocols = items
 	}
 	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
 		if f, err := parseFloat(v); err == nil {
